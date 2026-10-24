@@ -62,6 +62,22 @@ body {
 
 .hint.on { opacity: 0.6; }
 
+.sensor {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: max(18px, env(safe-area-inset-bottom));
+  text-align: center;
+  font: 500 11px/1.4 var(--font-ui);
+  color: var(--hint);
+  padding: 0 24px;
+  opacity: 0;
+  transition: opacity 0.6s ease;
+  pointer-events: none;
+}
+
+.sensor.on { opacity: 0.8; }
+
 @media (prefers-reduced-motion: reduce) {
   .hint { transition: none; }
 }
@@ -69,7 +85,8 @@ body {
 </head>
 <body>
 <canvas id="glass" role="img" aria-label="Czarne szkło. Dotknij albo przesuń palcem, aby je stłuc."></canvas>
-<div id="hint" class="hint" aria-hidden="true">dotknij</div>
+<div id="hint" class="hint" aria-hidden="true">tap to start</div>
+<div id="sensor" class="sensor" aria-live="polite"></div>
 
 <script>
 (() => {
@@ -77,16 +94,29 @@ body {
 
 /* ---------- ustawienia (tu możesz kręcić) ---------- */
 const CFG = {
-  limit: 14,          // ile "obrażeń" wytrzymuje szkło, zanim się rozsypie
-  tapDamage: 1,       // pojedyncze uderzenie
-  trailDamage: 0.18,  // odcinek pęknięcia za palcem
+  limit: 10,          // ile "obrażeń" wytrzymuje szkło, zanim się rozsypie
+  tapDamage: 2,       // pojedyncze uderzenie
+  trailDamage: 0.8,   // odcinek pęknięcia za palcem
   starDamage: 0.5,    // mały "wybuch" w trakcie przeciągania
   hitStop: 0.9,       // szansa, że nowe pęknięcie urwie się na istniejącym (reszta: przecina je)
   hitJoin: 0.3,       // szansa, że po dojściu do starego pęknięcia odgałęzi się dalej wzdłuż niego
-  gravity: 2400,      // px/s^2 dla odłamków
+  slide: 4500,        // px/s^2: przyspieszenie zsuwania odłamków przy przechyle 90 stopni
+  stick: 0.85,        // tarcie spoczynkowe (współczynnik): odłamek rusza, gdy tangens przechyłu > stick
+  slideFric: 0.7,     // tarcie w ruchu (współczynnik, hamuje zsuwające się odłamki)
+  finger: 40,         // promień palca w px przy popychaniu odłamków
+  pushForce: 300,     // px/s: prędkość, jaką samo dotknięcie (bez przesuwania) nadaje trafionemu odłamkowi
+  pushGain: 1.1,      // przy przesuwaniu: prędkość odłamka = prędkość palca razy tyle
+  pushMax: 4000,      // px/s: górna granica prędkości odłamka od przesuwanego palca
+  pushHop: 120,       // px/s: jak mocno palec podrzuca trafiony odłamek
+  pushFric: 0.8,     // mnożnik tarcia w ruchu dla odłamka popchniętego palcem (mniej = dalej jedzie)
+  bounce: 0.2,       // sprężystość zderzeń odłamków między sobą (0 = bez odbicia, 1 = pełne)
+  shake: 3.0,         // wzmocnienie reakcji na szarpnięcia, podrzuty i obroty telefonu
+  hopGravity: 8600,   // px/s^2: jak szybko podskakujący odłamek opada z powrotem na ekran
+  shardLife: 40,      // po ilu sekundach leżące odłamki same znikają
   hintDelay: 3500,    // po ilu ms bez dotyku pokazać "dotknij"
-  tiltNeutral: 60,    // kąt nachylenia telefonu (beta, w stopniach) przy neutralnym kolorze
-  tiltRange: 40       // ile stopni od neutralnego daje pełne ocieplenie / ochłodzenie
+  baseLight: 0.15,    // jasność linii bez odbicia (0..1), im mniej, tym ciemniej poza refleksami
+  tiltGain: 1.7,      // ile razy wzmocnić pochylenie telefonu (większe = silniejsza reakcja)
+  shine: 14           // ostrość odbić: im więcej, tym węższy refleks i szybsza reakcja na pochylenie
 };
 
 const cv = document.getElementById('glass');
@@ -125,7 +155,11 @@ let damage = 0;
 let shatterAt = 0, shX = 0, shY = 0;
 let flashT = 0;
 let raf = 0, lastT = 0;
-let tilt = 0, tiltTarget = 0;   // -1 = ekran w dół (cień, chłodno), 0 = neutralnie, 1 = ekran w górę (światło, ciepło)
+// kierunek światła (z góry) w układzie telefonu: x w prawo, y w górę ekranu, z do oczu
+// domyślnie telefon trzymany ok. 55 stopni od poziomu (ekran zwrócony ku twarzy)
+let lx = 0, ly = 0.819, lz = 0.574;
+let ltx = lx, lty = ly, ltz = lz;   // wartość docelowa z czujnika, światło dąży do niej płynnie
+function lightMoving() { return lx !== ltx || ly !== lty || lz !== ltz; }
 
 function kick() { if (!raf) raf = requestAnimationFrame(frame); }
 
@@ -370,6 +404,8 @@ function register(out, x, y, flash) {
   for (let k = 0; k < 3; k++) {
     for (const s of out[k]) {
       if (s.t1 > tEnd) tEnd = s.t1;
+      s.k = k;
+      prepLight(s);
       gridAdd(s);
       storeSegs.push(s);
     }
@@ -457,7 +493,7 @@ function spawnStar(x, y, o) {
     pushSeg(out, { x1: x, y1: y, x2: x + Math.cos(a) * l, y2: y + Math.sin(a) * l,
                    t0: T0, t1: T0 + 0.02, w: 1.6 });
   }
-  if (o.haze) haze(x, y, o.haze, 0.05);
+  if (o.haze) haze(x, y, o.haze, 0.035);
   register(out, x, y, o.flash);
 }
 
@@ -485,30 +521,91 @@ function spawnTrail(x0, y0, x1, y1) {
   register(out, x1, y1, false);
 }
 
-/* ---------- rysowanie pęknięć ---------- */
-// Pęknięcia rysujemy w jednym, jasnym odcieniu. Właściwy kolor (zależny od nachylenia
-// telefonu) nakłada na końcu klatki mnożenie przez odcień, patrz tintCss i frame.
-function drawBuckets(c, b, now) {
+/* ---------- światło: każdy odcinek pęknięcia łapie odbicie osobno ---------- */
+// Odcinek pęknięcia to mała ścianka szkła. Jej normalna jest prostopadła do linii
+// (w płaszczyźnie ekranu) i odchylona w głąb, a odchylenie zmienia się płynnie po ekranie,
+// jak nachylenie płaskich odłamków. Światło pada z góry (świata), więc w układzie telefonu
+// jego kierunek wynika z pochylenia. Jasność to odbicie lustrzane (normalna ścianki kontra
+// wektor połówkowy H), a odcień zależy od strony odbicia (rozszczepienie barw).
+const SEED = Math.random() * 1000;
+
+function hash2(ix, iy) {
+  const v = Math.sin(ix * 127.1 + iy * 311.7 + SEED) * 43758.5453;
+  return v - Math.floor(v);
+}
+
+function vnoise(x, y) {
+  const ix = Math.floor(x), iy = Math.floor(y);
+  const fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  const a = hash2(ix, iy), b = hash2(ix + 1, iy), c = hash2(ix, iy + 1), d = hash2(ix + 1, iy + 1);
+  return a + (b - a) * ux + (c - a) * uy + (a - b - c + d) * ux * uy;
+}
+
+// stałe cechy ścianki odcinka, liczone raz przy dodaniu pęknięcia
+function prepLight(s) {
+  const dx = s.x2 - s.x1, dy = s.y2 - s.y1;
+  const l = Math.hypot(dx, dy) || 1;
+  const m = Math.max(-0.95, Math.min(0.95,
+    (vnoise((s.x1 + s.x2) / 180, (s.y1 + s.y2) / 180) * 2 - 1) * 1.8));
+  // prostopadła do linii, w układzie "y w górę"; m to odchylenie ścianki (ze znakiem)
+  const nx = (-dy / l) * m + rnd(-0.12, 0.12);
+  const ny = (-dx / l) * m + rnd(-0.12, 0.12);
+  const nl = Math.hypot(nx, ny, 1);
+  s.nx = nx / nl; s.ny = ny / nl; s.nz = 1 / nl;
+}
+
+const NB = 6, NH = 5;   // poziomy jasności i odcienie (pojemniki kolorów)
+const HUE = [[120, 165, 235], [135, 205, 225], [205, 222, 238], [240, 215, 170], [235, 175, 160]]
+  .map((c) => c.map((v) => Math.round(v * 0.55 + 150 * 0.45)));
+const BINS = [0, 1, 2].map(() => Array.from({ length: NB * NH }, () => []));
+
+function drawCracks(c, now) {
+  const ll = Math.hypot(lx, ly, lz) || 1;
+  let hx = lx / ll, hy = ly / ll, hz = lz / ll + 1;   // L + V, gdzie V = (0, 0, 1)
+  const hl = Math.hypot(hx, hy, hz) || 1;
+  hx /= hl; hy /= hl; hz /= hl;
+  // ekran zwrócony od światła (telefon w dół) jest ogólnie ciemniejszy
+  const mz = 0.55 + 0.45 * Math.max(0, Math.min(1, (lz / ll + 0.2) / 0.8));
+  const base = CFG.baseLight, ks = CFG.shine;
+
+  for (const row of BINS) for (const arr of row) arr.length = 0;
+  for (let i = 0; i < storeSegs.length; i++) {
+    const s = storeSegs[i];
+    if (now <= s.t0) continue;
+    const spec = Math.exp(-(1 - (s.nx * hx + s.ny * hy + s.nz * hz)) * ks);
+    const I = (base + (1 - base) * spec) * mz;
+    const bi = I >= 1 ? NB - 1 : Math.floor(I * NB);
+    const h = 0.5 + (s.nx * hy - s.ny * hx) * 3.5;
+    const hb = h <= 0 ? 0 : (h >= 1 ? NH - 1 : Math.floor(h * NH));
+    BINS[s.k][hb * NB + bi].push(s);
+  }
+
   c.lineCap = 'round';
   c.lineJoin = 'round';
   for (let pass = 0; pass < 2; pass++) {
     c.globalCompositeOperation = pass === 0 ? 'lighter' : 'source-over';
-    c.strokeStyle = pass === 0 ? 'rgba(110,195,255,0.08)' : 'rgba(236,247,255,0.72)';
     for (let k = 0; k < 3; k++) {
-      const arr = b[k];
-      if (!arr.length) continue;
       c.lineWidth = pass === 0 ? GLOW_W[k] : CORE_W[k];
-      c.beginPath();
-      let any = false;
-      for (let i = 0; i < arr.length; i++) {
-        const s = arr[i];
-        if (now <= s.t0) continue;
-        const f = now >= s.t1 ? 1 : (now - s.t0) / (s.t1 - s.t0);
-        c.moveTo(s.x1, s.y1);
-        c.lineTo(s.x1 + (s.x2 - s.x1) * f, s.y1 + (s.y2 - s.y1) * f);
-        any = true;
+      for (let hb = 0; hb < NH; hb++) {
+        const col = HUE[hb];
+        for (let bi = 0; bi < NB; bi++) {
+          if (pass === 0 && bi < 2) continue;   // poświatę mają tylko jaśniejsze odcinki
+          const arr = BINS[k][hb * NB + bi];
+          if (!arr.length) continue;
+          const ic = (bi + 0.5) / NB;
+          const al = pass === 0 ? 0.07 * ic : 0.12 + 0.52 * ic;
+          c.strokeStyle = 'rgba(' + col[0] + ',' + col[1] + ',' + col[2] + ',' + al.toFixed(3) + ')';
+          c.beginPath();
+          for (let j = 0; j < arr.length; j++) {
+            const s = arr[j];
+            const f = now >= s.t1 ? 1 : (now - s.t0) / (s.t1 - s.t0);
+            c.moveTo(s.x1, s.y1);
+            c.lineTo(s.x1 + (s.x2 - s.x1) * f, s.y1 + (s.y2 - s.y1) * f);
+          }
+          c.stroke();
+        }
       }
-      if (any) c.stroke();
     }
   }
   c.globalCompositeOperation = 'source-over';
@@ -520,8 +617,8 @@ function drawFlash(im, now) {
   if (age < 0 || age > 0.3) return;
   const k = 1 - age / 0.3, a = k * k, r = 45 + age * 260;
   const g = ctx.createRadialGradient(im.x, im.y, 0, im.x, im.y, r);
-  g.addColorStop(0, 'rgba(255,255,255,' + (0.55 * a) + ')');
-  g.addColorStop(0.35, 'rgba(150,215,255,' + (0.16 * a) + ')');
+  g.addColorStop(0, 'rgba(215,230,245,' + (0.4 * a) + ')');
+  g.addColorStop(0.35, 'rgba(150,200,240,' + (0.12 * a) + ')');
   g.addColorStop(1, 'rgba(150,215,255,0)');
   ctx.globalCompositeOperation = 'lighter';
   ctx.fillStyle = g;
@@ -529,137 +626,305 @@ function drawFlash(im, now) {
   ctx.globalCompositeOperation = 'source-over';
 }
 
-/* ---------- kolor zależny od nachylenia (światło pada z góry) ---------- */
-// Ekran skierowany w górę (telefon odchylony do tyłu) łapie światło: ciepło i jaśniej.
-// Ekran skierowany w dół (telefon pochylony do przodu) jest w cieniu: chłodno i ciemniej.
-const TINT_COOL = [112, 146, 204];
-const TINT_MID  = [196, 209, 223];
-const TINT_WARM = [255, 233, 192];
-
-function mixRGB(a, b, f) {
-  return [
-    Math.round(a[0] + (b[0] - a[0]) * f),
-    Math.round(a[1] + (b[1] - a[1]) * f),
-    Math.round(a[2] + (b[2] - a[2]) * f)
-  ];
-}
-
-function tintCss(n) {
-  const c = n < 0 ? mixRGB(TINT_MID, TINT_COOL, -n) : mixRGB(TINT_MID, TINT_WARM, n);
-  return 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')';
-}
-
+/* ---------- czujnik pochylenia ---------- */
+// Kierunek "w górę" świata w układzie telefonu (x w prawo, y w górę ekranu, z do oczu):
+// u = (-sin(gamma) cos(beta), sin(beta), cos(gamma) cos(beta)). Światło pada z góry, więc L = u.
+let gotTilt = false;
+let tiltB = 55, tiltG = 0;   // surowe kąty z czujnika (dla zsuwania odłamków); bez czujnika: trzymany pod 55 stopni
 function onTilt(e) {
-  if (e.beta == null) return;
-  const n = (CFG.tiltNeutral - e.beta) / CFG.tiltRange;
-  tiltTarget = Math.max(-1, Math.min(1, n));
-  if (Math.abs(tiltTarget - tilt) > 0.004) kick();
+  if (e.beta == null || e.gamma == null) return;
+  if (!gotTilt) { gotTilt = true; sensorMsg(''); }
+  tiltB = e.beta; tiltG = e.gamma;
+  // pochylenie liczone względem pozycji trzymania (55 stopni) i wzmocnione
+  const bd = Math.max(-90, Math.min(180, 55 + (e.beta - 55) * CFG.tiltGain));
+  const gd = Math.max(-80, Math.min(80, e.gamma * CFG.tiltGain));
+  const b = bd * Math.PI / 180, g = gd * Math.PI / 180;
+  ltx = -Math.sin(g) * Math.cos(b);
+  lty = Math.sin(b);
+  ltz = Math.cos(g) * Math.cos(b);
+  if (Math.abs(ltx - lx) + Math.abs(lty - ly) + Math.abs(ltz - lz) > 0.003) kick();
+}
+
+// nasłuch podpinamy zawsze: na iOS zdarzenia ruszą dopiero po zgodzie, gdzie indziej od razu
+window.addEventListener('deviceorientation', onTilt);
+
+/* ---------- ruch telefonu (szarpnięcia, podrzuty, obroty) dla odłamków ---------- */
+// Układ telefonu: x w prawo, y w górę ekranu, z do oczu. Przyspieszenia w m/s^2 (bez grawitacji),
+// przyspieszenia kątowe w rad/s^2 liczone z różnicy kolejnych prędkości obrotu.
+let mAx = 0, mAy = 0, mAz = 0, mAlx = 0, mAly = 0, mAlz = 0, mWz = 0, mT = -1;
+let lastRR = null, lastRRt = 0;
+function onMotion(e) {
+  const a = e.acceleration;
+  if (a && a.x != null) { mAx = a.x; mAy = a.y; mAz = a.z || 0; }
+  const r = e.rotationRate, t = e.timeStamp / 1000;
+  if (r && r.alpha != null) {
+    // beta: obrót wokół x, gamma: wokół y, alpha: wokół z (w stopniach na sekundę)
+    const cur = [r.beta * Math.PI / 180, r.gamma * Math.PI / 180, r.alpha * Math.PI / 180];
+    if (lastRR && t > lastRRt) {
+      const d = Math.max(0.008, t - lastRRt);
+      const cl = (v) => Math.max(-300, Math.min(300, v));
+      mAlx = cl((cur[0] - lastRR[0]) / d);
+      mAly = cl((cur[1] - lastRR[1]) / d);
+      mAlz = cl((cur[2] - lastRR[2]) / d);
+    }
+    lastRR = cur; lastRRt = t;
+    mWz = cur[2];
+  }
+  mT = nowS();
+  if (shards) kick();
+}
+window.addEventListener('devicemotion', onMotion);
+
+function sensorMsg(t) {
+  const el = document.getElementById('sensor');
+  if (!el) return;
+  el.textContent = t;
+  el.classList.toggle('on', !!t);
+}
+
+let sensorChecked = false;
+function checkSensor() {
+  if (sensorChecked) return;
+  sensorChecked = true;
+  setTimeout(() => {
+    if (gotTilt) return;
+    sensorMsg(window.isSecureContext
+      ? 'brak danych z czujnika: zezwól na ruch i orientację'
+      : 'pochylenie wymaga HTTPS (adres musi zaczynać się od https://)');
+    setTimeout(() => sensorMsg(''), 7000);
+  }, 1800);
 }
 
 let tiltAsked = false;
 function initTilt() {
+  checkSensor();
   if (tiltAsked) return;
   const D = window.DeviceOrientationEvent;
-  if (!D) return;
-  if (typeof D.requestPermission === 'function') {
-    // iOS: zgodę wolno zapytać tylko z gestu użytkownika
-    tiltAsked = true;
-    D.requestPermission().then((r) => {
-      if (r === 'granted') window.addEventListener('deviceorientation', onTilt);
-    }).catch(() => { tiltAsked = false; });
-  } else {
-    tiltAsked = true;
-    window.addEventListener('deviceorientation', onTilt);
+  // zgodę wolno zapytać tylko z gestu użytkownika (iOS); inne przeglądarki jej nie wymagają
+  if (!D || typeof D.requestPermission !== 'function') return;
+  tiltAsked = true;
+  try {
+    const p = D.requestPermission();
+    if (p && p.catch) p.catch(() => { tiltAsked = false; });
+  } catch (err) { tiltAsked = false; }
+  // osobna zgoda na zdarzenia ruchu (podrzuty odłamków)
+  const M = window.DeviceMotionEvent;
+  if (M && typeof M.requestPermission === 'function') {
+    try { const p = M.requestPermission(); if (p && p.catch) p.catch(() => {}); } catch (err) {}
   }
 }
 
-/* ---------- rozbicie: odłamki jako komórki Voronoia ---------- */
-function clipHalf(poly, a, b, c) {
-  const out = [];
-  const n = poly.length;
-  for (let i = 0; i < n; i++) {
-    const p = poly[i], q = poly[(i + 1) % n];
-    const dp = a * p[0] + b * p[1] - c, dq = a * q[0] + b * q[1] - c;
-    if (dp <= 0) out.push(p);
-    if ((dp < 0 && dq > 0) || (dp > 0 && dq < 0)) {
-      const t = dp / (dp - dq);
-      out.push([p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t]);
-    }
-  }
-  return out;
-}
+/* ---------- rozbicie: tafla pęka wzdłuż istniejących pęknięć ---------- */
+// Pęknięcia są rysowane jako ściany na siatce (komórka G px), a obszary między nimi
+// to odłamki (wypełnianie przez sąsiedztwo 4-kierunkowe, więc ukośne linie też zamykają).
+// Drobiazgi są wchłaniane przez sąsiadów, a za duże obszary dzielone na kilka kawałków.
+const MAX_SHARDS = 220;
+const MS = 3;     // komórka maski odłamka (px)
+const OB = 16;    // liczba punktów obrysu odłamka do wykrywania zderzeń
+const PXM = 0.00016;   // ile metrów ma piksel CSS (do przeliczenia ruchu telefonu na ekran)
 
 function shatter(cx, cy, now) {
-  for (const im of impacts) drawBuckets(lctx, im.b, Infinity);
+  drawCracks(lctx, Infinity);
   impacts.length = 0;
 
-  const N = Math.max(40, Math.min(80, Math.round(W * H / 9000)));
-  const maxR = Math.hypot(Math.max(cx, W - cx), Math.max(cy, H - cy));
-  const seeds = [[cx, cy]];
-  let guard = 0;
-  while (seeds.length < N && guard++ < 3000) {
-    const r = maxR * Math.pow(Math.random(), 1.6), a = Math.random() * Math.PI * 2;
-    const sx = cx + Math.cos(a) * r, sy = cy + Math.sin(a) * r;
-    if (sx >= 0 && sx <= W && sy >= 0 && sy <= H) seeds.push([sx, sy]);
+  const G = W * H > 1.2e6 ? 2 : 1;
+  const gw = Math.ceil(W / G), gh = Math.ceil(H / G), n = gw * gh;
+  const lab = new Int32Array(n).fill(-1);
+  const wall = new Uint8Array(n);
+  for (const s of storeSegs) {
+    if (s.w < 0.45) continue;   // najcieńsze końcówki nie dzielą szkła
+    const st = Math.max(1, Math.ceil(Math.hypot(s.x2 - s.x1, s.y2 - s.y1) / (G * 0.5)));
+    for (let i = 0; i <= st; i++) {
+      const x = Math.floor((s.x1 + (s.x2 - s.x1) * i / st) / G);
+      const y = Math.floor((s.y1 + (s.y2 - s.y1) * i / st) / G);
+      if (x >= 0 && x < gw && y >= 0 && y < gh) wall[y * gw + x] = 1;
+    }
   }
 
-  shards = [];
-  for (let i = 0; i < seeds.length; i++) {
-    let poly = [[0, 0], [W, 0], [W, H], [0, H]];
-    const si = seeds[i];
-    for (let j = 0; j < seeds.length && poly.length >= 3; j++) {
-      if (j === i) continue;
-      const sj = seeds[j];
-      poly = clipHalf(poly, 2 * (sj[0] - si[0]), 2 * (sj[1] - si[1]),
-                      sj[0] * sj[0] + sj[1] * sj[1] - si[0] * si[0] - si[1] * si[1]);
+  // obszary między pęknięciami
+  const q = new Int32Array(n);
+  let area = [];
+  let nl = 0;
+  for (let i = 0; i < n; i++) {
+    if (wall[i] || lab[i] >= 0) continue;
+    let h = 0, t = 0;
+    q[t++] = i; lab[i] = nl;
+    while (h < t) {
+      const c = q[h++], x = c % gw;
+      if (x > 0 && !wall[c - 1] && lab[c - 1] < 0) { lab[c - 1] = nl; q[t++] = c - 1; }
+      if (x < gw - 1 && !wall[c + 1] && lab[c + 1] < 0) { lab[c + 1] = nl; q[t++] = c + 1; }
+      if (c >= gw && !wall[c - gw] && lab[c - gw] < 0) { lab[c - gw] = nl; q[t++] = c - gw; }
+      if (c < n - gw && !wall[c + gw] && lab[c + gw] < 0) { lab[c + gw] = nl; q[t++] = c + gw; }
     }
-    if (poly.length < 3) continue;
+    area.push(t);
+    nl++;
+  }
 
-    let minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9, ax = 0, ay = 0;
-    for (const p of poly) {
-      if (p[0] < minX) minX = p[0];
-      if (p[1] < minY) minY = p[1];
-      if (p[0] > maxX) maxX = p[0];
-      if (p[1] > maxY) maxY = p[1];
-      ax += p[0]; ay += p[1];
+  // zostają największe obszary, drobne (i ściany) rozdzielamy między sąsiadów
+  const minCells = 260 / (G * G);
+  const order = area.map((a, i) => i).sort((a, b) => area[b] - area[a]);
+  const remap = new Int32Array(nl).fill(-1);
+  let K = 0;
+  for (const l of order) {
+    if (K >= MAX_SHARDS || (area[l] < minCells && K > 0)) break;
+    remap[l] = K++;
+  }
+  let t = 0;
+  for (let i = 0; i < n; i++) {
+    lab[i] = lab[i] >= 0 ? remap[lab[i]] : -1;
+    if (lab[i] >= 0) q[t++] = i;
+  }
+  if (!K) { lab.fill(0); K = 1; }
+  for (let h = 0; h < t; h++) {
+    const c = q[h], x = c % gw, l = lab[c];
+    if (x > 0 && lab[c - 1] < 0) { lab[c - 1] = l; q[t++] = c - 1; }
+    if (x < gw - 1 && lab[c + 1] < 0) { lab[c + 1] = l; q[t++] = c + 1; }
+    if (c >= gw && lab[c - gw] < 0) { lab[c - gw] = l; q[t++] = c - gw; }
+    if (c < n - gw && lab[c + gw] < 0) { lab[c + gw] = l; q[t++] = c + gw; }
+  }
+
+  // za duże obszary (tam, gdzie pęknięć było mało) dzielimy na kilka kawałków
+  area = new Array(K).fill(0);
+  for (let i = 0; i < n; i++) area[lab[i]]++;
+  const maxCells = W * H / 26 / (G * G);
+  const split = new Map();
+  for (let l = 0; l < K; l++) {
+    if (area[l] > maxCells) split.set(l, { k: Math.ceil(area[l] / maxCells), seeds: [], seen: 0 });
+  }
+  if (split.size) {
+    // losowe ziarna z komórek obszaru (losowanie rezerwuarowe)
+    for (let i = 0; i < n; i++) {
+      const sp = split.get(lab[i]);
+      if (!sp) continue;
+      sp.seen++;
+      if (sp.seeds.length < sp.k) sp.seeds.push(i);
+      else if (Math.random() * sp.seen < sp.k) sp.seeds[Math.floor(Math.random() * sp.k)] = i;
     }
-    ax /= poly.length; ay /= poly.length;
-    minX -= 1; minY -= 1; maxX += 1; maxY += 1;
-    const bw = maxX - minX, bh = maxY - minY;
+    for (const [l, sp] of split) {
+      sp.lab = sp.seeds.map((c, j) => (j === 0 ? l : K++));
+      sp.sx = sp.seeds.map((c) => c % gw);
+      sp.sy = sp.seeds.map((c) => Math.floor(c / gw));
+    }
+    for (let i = 0; i < n; i++) {
+      const sp = split.get(lab[i]);
+      if (!sp) continue;
+      const x = i % gw, y = Math.floor(i / gw);
+      let bj = 0, bd = Infinity;
+      for (let j = 0; j < sp.sx.length; j++) {
+        const d = (x - sp.sx[j]) ** 2 + (y - sp.sy[j]) ** 2;
+        if (d < bd) { bd = d; bj = j; }
+      }
+      lab[i] = sp.lab[bj];
+    }
+  }
+
+  // ramki i środki odłamków
+  const bx0 = new Int32Array(K).fill(gw), by0 = new Int32Array(K).fill(gh);
+  const bx1 = new Int32Array(K).fill(-1), by1 = new Int32Array(K).fill(-1);
+  const sumX = new Float64Array(K), sumY = new Float64Array(K), cnt = new Int32Array(K);
+  for (let i = 0; i < n; i++) {
+    const l = lab[i], x = i % gw, y = (i - x) / gw;
+    if (x < bx0[l]) bx0[l] = x;
+    if (x > bx1[l]) bx1[l] = x;
+    if (y < by0[l]) by0[l] = y;
+    if (y > by1[l]) by1[l] = y;
+    sumX[l] += x; sumY[l] += y; cnt[l]++;
+  }
+
+  // maska (wnętrze odłamka) i krawędź (styk z innym odłamkiem), w rozdzielczości siatki
+  const mk = document.createElement('canvas'), ek = document.createElement('canvas');
+  mk.width = ek.width = gw + 2;
+  mk.height = ek.height = gh + 2;
+  const mctx = mk.getContext('2d'), ectx = ek.getContext('2d');
+  const maxR = Math.hypot(Math.max(cx, W - cx), Math.max(cy, H - cy));
+
+  shards = [];
+  for (let l = 0; l < K; l++) {
+    if (!cnt[l]) continue;
+    const cw = bx1[l] - bx0[l] + 3, ch = by1[l] - by0[l] + 3;
+    const x0 = (bx0[l] - 1) * G, y0 = (by0[l] - 1) * G, pw = cw * G, ph = ch * G;
+    const ax = (sumX[l] / cnt[l] + 0.5) * G, ay = (sumY[l] / cnt[l] + 0.5) * G;
+    const mi = mctx.createImageData(cw, ch), ei = ectx.createImageData(cw, ch);
+    // zgrubna maska do zderzeń i trafień palcem (komórka MS px) oraz obrys: najdalszy
+    // punkt krawędzi w każdym z OB kierunków od środka
+    const mw = Math.ceil(pw / MS), mh = Math.ceil(ph / MS);
+    const m = new Uint8Array(mw * mh);
+    const ob = new Float64Array(OB * 3).fill(-1);
+    for (let y = by0[l]; y <= by1[l]; y++) {
+      for (let x = bx0[l]; x <= bx1[l]; x++) {
+        const c = y * gw + x;
+        if (lab[c] !== l) continue;
+        const o = ((y - by0[l] + 1) * cw + (x - bx0[l] + 1)) * 4;
+        mi.data[o + 3] = 255;
+        m[Math.floor(((y + 0.5) * G - y0) / MS) * mw + Math.floor(((x + 0.5) * G - x0) / MS)] = 1;
+        const inner = (x > 0 && lab[c - 1] !== l) || (x < gw - 1 && lab[c + 1] !== l) ||
+                      (y > 0 && lab[c - gw] !== l) || (y < gh - 1 && lab[c + gw] !== l);
+        if (inner) {
+          ei.data[o] = 225; ei.data[o + 1] = 242; ei.data[o + 2] = 255; ei.data[o + 3] = 85;
+        }
+        if (inner || x === 0 || y === 0 || x === gw - 1 || y === gh - 1) {
+          const ex = (x + 0.5) * G - ax, ey = (y + 0.5) * G - ay, d = ex * ex + ey * ey;
+          const bi = Math.floor((Math.atan2(ey, ex) / (2 * Math.PI) + 0.5) * OB) % OB;
+          if (d > ob[bi * 3]) { ob[bi * 3] = d; ob[bi * 3 + 1] = ex; ob[bi * 3 + 2] = ey; }
+        }
+      }
+    }
+    const ol = [];
+    let ro = 4;
+    for (let i = 0; i < OB; i++) {
+      if (ob[i * 3] < 0) continue;
+      const d = Math.sqrt(ob[i * 3]) || 1, f = Math.max(0, d - 3) / d;   // trochę do środka
+      ol.push([ob[i * 3 + 1] * f, ob[i * 3 + 2] * f]);
+      if (d > ro) ro = d;
+    }
+    mctx.clearRect(0, 0, mk.width, mk.height);
+    ectx.clearRect(0, 0, ek.width, ek.height);
+    mctx.putImageData(mi, 0, 0);
+    ectx.putImageData(ei, 0, 0);
 
     const sc = document.createElement('canvas');
-    sc.width = Math.max(1, Math.ceil(bw * DPR));
-    sc.height = Math.max(1, Math.ceil(bh * DPR));
+    sc.width = Math.max(1, Math.ceil(pw * DPR));
+    sc.height = Math.max(1, Math.ceil(ph * DPR));
     const c = sc.getContext('2d');
-    c.setTransform(DPR, 0, 0, DPR, -minX * DPR, -minY * DPR);
-    c.beginPath();
-    poly.forEach((p, k) => (k ? c.lineTo(p[0], p[1]) : c.moveTo(p[0], p[1])));
-    c.closePath();
-    c.save();
-    c.clip();
+    c.setTransform(DPR, 0, 0, DPR, -x0 * DPR, -y0 * DPR);
     c.fillStyle = 'rgba(160,215,255,' + rnd(0.04, 0.09) + ')';
-    c.fillRect(minX, minY, bw, bh);
-    c.drawImage(layer, 0, 0, W, H);
-    c.restore();
-    c.lineJoin = 'round';
-    c.lineWidth = 1.2;
-    c.strokeStyle = 'rgba(225,242,255,0.55)';
-    c.stroke();
+    c.fillRect(x0, y0, pw, ph);
+    // tylko potrzebny wycinek warstwy z pęknięciami
+    const sx0 = Math.max(0, x0), sy0 = Math.max(0, y0);
+    const sx1 = Math.min(W, x0 + pw), sy1 = Math.min(H, y0 + ph);
+    if (sx1 > sx0 && sy1 > sy0) {
+      c.drawImage(layer, sx0 * DPR, sy0 * DPR, (sx1 - sx0) * DPR, (sy1 - sy0) * DPR,
+                  sx0, sy0, sx1 - sx0, sy1 - sy0);
+    }
+    c.imageSmoothingEnabled = true;
+    c.globalCompositeOperation = 'destination-in';
+    c.drawImage(mk, 0, 0, cw, ch, x0, y0, pw, ph);
+    c.globalCompositeOperation = 'source-over';
+    c.drawImage(ek, 0, 0, cw, ch, x0, y0, pw, ph);
 
     const dist = Math.hypot(ax - cx, ay - cy);
     let dx = ax - cx, dy = ay - cy;
     const dl = Math.hypot(dx, dy) || 1;
     dx /= dl; dy /= dl;
-    const v0 = Math.min(900, (120 + 14000 / (dist + 60)) * rnd(0.6, 1.2));
+    // odłamki podskakują (ku oczom) i rozjeżdżają się trochę od miejsca uderzenia
+    const v0 = Math.min(280, (20 + 4500 / (dist + 60)) * rnd(0.5, 1.1));
     shards.push({
-      cv: sc, bx: minX, by: minY, bw, bh, cx0: ax, cy0: ay,
-      x: ax, y: ay, rot: 0,
-      vx: dx * v0 + rnd(-40, 40),
-      vy: dy * v0 + rnd(-140, 30),
-      w: rnd(-3, 3) * (1 + 80 / (dist + 80)),
-      g: rnd(0.85, 1.15),
+      cv: sc, bx: x0, by: y0, bw: pw, bh: ph, cx0: ax, cy0: ay,
+      x: ax, y: ay, rot: 0, z: 0,
+      vx: dx * v0 + rnd(-25, 25),
+      vy: dy * v0 + rnd(-25, 25),
+      vz: Math.min(700, (220 + 30000 / (dist + 100)) * rnd(0.6, 1.1)),
+      w: rnd(-2.5, 2.5) * (1 + 60 / (dist + 60)),
+      mu: rnd(0.7, 1.3),
       delay: now + 0.04 + (dist / maxR) * 0.22 + rnd(0, 0.08),
-      r: Math.hypot(bw, bh) / 2,
+      r: Math.hypot(pw, ph) / 2,
+      m, mw, mh, ol, ro,
+      mass: cnt[l] * G * G,
+      inertia: (cnt[l] * G * G) ** 2 / (2 * Math.PI),
+      // przewrót w powietrzu: flip to kąt obrotu wokół osi w płaszczyźnie ekranu,
+      // fs = 1 albo -1 (odłamek leży normalnie albo odwrócony)
+      flip: 0, fw: Math.random() < 0.2 ? rnd(-9, 9) : 0, fs: 1,
+      pushed: false,
       dead: false
     });
   }
@@ -669,25 +934,241 @@ function shatter(cx, cy, now) {
   vib([30, 40, 30, 40, 90]);
 }
 
+// grawitacja świata w układzie ekranu (x w prawo, y w dół), w jednostkach g:
+// [składowa wzdłuż ekranu x, składowa wzdłuż ekranu y, nacisk na ekran (do tarcia)]
+function slideAcc() {
+  const b = tiltB * Math.PI / 180, g = tiltG * Math.PI / 180;
+  return [Math.sin(g) * Math.cos(b), Math.sin(b), Math.abs(Math.cos(g) * Math.cos(b))];
+}
+
 function drawShards(now, dt) {
+  const [gx, gy, gn] = slideAcc();
+  const A = CFG.slide, HG = CFG.hopGravity;
+  const mv = now - mT < 0.15 ? CFG.shake : 0;   // tylko świeże dane o ruchu telefonu
+  const wz2 = mWz * mWz;
+  for (const s of shards) {
+    if (s.dead || now < s.delay) continue;
+    // Telefon szarpnięty albo obrócony: odłamek z bezwładności "zostaje w miejscu", więc
+    // w układzie ekranu czuje przyspieszenie przeciwne (plus odśrodkowe przy obrocie).
+    // N to nacisk na ekran w jednostkach g; poniżej zera odłamek odrywa się od ekranu.
+    let tx = gx, ty = gy, N = Math.max(0.35, gn);
+    if (mv) {
+      const rx = (s.x - W / 2) * PXM, ru = (H / 2 - s.y) * PXM;   // metry, y w górę
+      const ax = -mAx + mAlz * ru + wz2 * rx;
+      const au = -mAy - mAlz * rx + wz2 * ru;
+      tx += ax / 9.81 * mv;
+      ty -= au / 9.81 * mv;
+      N += (mAz + mAlx * ru - mAly * rx) / 9.81 * mv;
+    }
+    s.vx += tx * A * dt;
+    s.vy += ty * A * dt;
+    if (s.z > 0 || s.vz > 0) {
+      // w powietrzu: bez tarcia, może się przewracać
+      s.vz -= N * HG * dt;
+      s.z += s.vz * dt;
+      s.flip += s.fw * dt;
+      if (s.z <= 0) {
+        // lądowanie na tafli: odbicie, utrata prędkości, obrót od uderzenia
+        const hit = -s.vz;
+        s.z = 0;
+        s.vz = hit > 150 ? hit * 0.28 : 0;
+        s.vx *= 0.7; s.vy *= 0.7;
+        s.w = s.w * 0.6 + rnd(-1, 1) * Math.min(5, hit / 120);
+        s.flip = Math.round(s.flip / Math.PI) * Math.PI;
+        s.fs = Math.cos(s.flip) < 0 ? -1 : 1;
+        s.fw = 0;
+        if (hit > 250) clink(Math.min(1, hit / 900) * 0.5);
+      }
+    } else if (N < 0) {
+      // podrzut: ekran odjeżdża spod odłamka, odłamek się odrywa, kręci i czasem przewraca
+      s.vz = -N * HG * dt;
+      s.z = 0.001;
+      s.w += rnd(-1, 1) * Math.min(6, -N * 4);
+      if (-N > 0.8 && Math.random() < 0.5) s.fw = rnd(5, 11) * (Math.random() < 0.5 ? -1 : 1);
+      s.pushed = false;
+    } else {
+      // leży na ekranie: tarcie spoczynkowe trzyma, w ruchu hamuje (słabiej po popchnięciu palcem)
+      const sp = Math.hypot(s.vx, s.vy);
+      if (sp < 6 && Math.hypot(tx, ty) < CFG.stick * s.mu * N) {
+        s.vx = 0; s.vy = 0; s.pushed = false;
+      } else if (sp > 0) {
+        const dv = CFG.slideFric * s.mu * N * (s.pushed ? CFG.pushFric : 1) * A * dt;
+        if (dv >= sp) { s.vx = 0; s.vy = 0; s.pushed = false; } else { s.vx -= s.vx / sp * dv; s.vy -= s.vy / sp * dv; }
+      }
+      s.w *= Math.exp(-4 * dt);
+    }
+    s.x += s.vx * dt;
+    s.y += s.vy * dt;
+    s.rot += s.w * dt;
+    if (s.x + s.r < -30 || s.x - s.r > W + 30 || s.y + s.r < -30 || s.y - s.r > H + 30) s.dead = true;
+  }
+
+  collide(now);
+
   let alive = 0;
+  const age = now - shards.t0;
+  ctx.globalAlpha = Math.max(0, Math.min(1, CFG.shardLife + 1 - age));
+  // najpierw leżące, na wierzchu te w powietrzu (lekko powiększone, bo bliżej oczu)
+  for (let pass = 0; pass < 2; pass++) {
+    for (const s of shards) {
+      if (s.dead || (s.z > 0) !== (pass === 1)) continue;
+      alive++;
+      const k = 1 + s.z / 700;
+      ctx.save();
+      ctx.translate(s.x, s.y);
+      ctx.rotate(s.rot);
+      ctx.scale(k * (s.z > 0 ? Math.cos(s.flip) : s.fs), k);
+      ctx.drawImage(s.cv, s.bx - s.cx0, s.by - s.cy0, s.bw, s.bh);
+      ctx.restore();
+    }
+  }
+  ctx.globalAlpha = 1;
+  if (!alive || age > CFG.shardLife + 1) endShatter();
+}
+
+// czy punkt ekranu leży na odłamku (zgrubna maska odłamka)
+function shardAt(s, x, y) {
+  const dx = x - s.x, dy = y - s.y;
+  const k = 1 + s.z / 700;
+  if (dx * dx + dy * dy > (s.ro * k + MS) ** 2) return false;
+  const fl = s.z > 0 ? Math.cos(s.flip) : s.fs;
+  if (Math.abs(fl) < 0.2) return false;
+  const co = Math.cos(s.rot), si = Math.sin(s.rot);
+  const mx = Math.floor(((dx * co + dy * si) / (k * fl) + s.cx0 - s.bx) / MS);
+  const my = Math.floor(((-dx * si + dy * co) / k + s.cy0 - s.by) / MS);
+  return mx >= 0 && my >= 0 && mx < s.mw && my < s.mh && s.m[my * s.mw + mx] === 1;
+}
+
+// kierunek na zewnątrz odłamka w punkcie (z maski), albo null
+function outward(s, x, y) {
+  const e = 5;
+  const nx = shardAt(s, x - e, y) - shardAt(s, x + e, y);
+  const ny = shardAt(s, x, y - e) - shardAt(s, x, y + e);
+  const l = Math.hypot(nx, ny);
+  return l ? [nx / l, ny / l] : null;
+}
+
+// Zderzenia leżących odłamków: punkty obrysu jednego wchodzące w drugi dają styk,
+// w nim impuls z odbiciem (CFG.bounce) i tarciem, który popycha i obraca oba kawałki.
+// Duże odłamki są ciężkie, więc małe głównie się od nich odbijają.
+let lastClink = 0;
+function collide(now) {
+  const act = [];
+  for (const s of shards) if (!s.dead && now >= s.delay && s.z < 3) act.push(s);
+  for (let i = 0; i < act.length; i++) {
+    const a = act[i];
+    const aMove = a.vx * a.vx + a.vy * a.vy > 4 || Math.abs(a.w) > 0.05;
+    for (let j = i + 1; j < act.length; j++) {
+      const b = act[j];
+      if (!aMove && !(b.vx * b.vx + b.vy * b.vy > 4 || Math.abs(b.w) > 0.05)) continue;
+      const rr = a.ro + b.ro;
+      if ((a.x - b.x) ** 2 + (a.y - b.y) ** 2 > rr * rr) continue;
+      // punkty obrysu a w b i b w a
+      let cx = 0, cy = 0, n = 0, own = null;
+      for (const [s, o] of [[a, b], [b, a]]) {
+        const co = Math.cos(s.rot), si = Math.sin(s.rot);
+        for (const p of s.ol) {
+          const px = p[0] * s.fs, py = p[1];
+          const wx = s.x + px * co - py * si, wy = s.y + px * si + py * co;
+          if (shardAt(o, wx, wy)) { cx += wx; cy += wy; n++; if (!own) own = s; }
+        }
+        if (n) break;
+      }
+      if (!n) continue;
+      cx /= n; cy /= n;
+      // normalna styku skierowana od b do a
+      const other = own === a ? b : a;
+      let nrm = outward(other, cx, cy);
+      if (nrm && own === b) nrm = [-nrm[0], -nrm[1]];
+      if (!nrm) {
+        const dx = a.x - b.x, dy = a.y - b.y, l = Math.hypot(dx, dy) || 1;
+        nrm = [dx / l, dy / l];
+      }
+      const [nx, ny] = nrm;
+      const rax = cx - a.x, ray = cy - a.y, rbx = cx - b.x, rby = cy - b.y;
+      const vrx = (a.vx - a.w * ray) - (b.vx - b.w * rby);
+      const vry = (a.vy + a.w * rax) - (b.vy + b.w * rbx);
+      const vn = vrx * nx + vry * ny;
+      if (vn >= 0) continue;   // już się rozjeżdżają
+      const raxn = rax * ny - ray * nx, rbxn = rbx * ny - rby * nx;
+      const jn = -(1 + CFG.bounce) * vn /
+        (1 / a.mass + 1 / b.mass + raxn * raxn / a.inertia + rbxn * rbxn / b.inertia);
+      a.vx += jn * nx / a.mass; a.vy += jn * ny / a.mass; a.w += raxn * jn / a.inertia;
+      b.vx -= jn * nx / b.mass; b.vy -= jn * ny / b.mass; b.w -= rbxn * jn / b.inertia;
+      // tarcie w styku: szuranie o krawędź obraca odłamki
+      let tx = vrx - vn * nx, ty = vry - vn * ny;
+      const tl = Math.hypot(tx, ty);
+      if (tl > 1e-3) {
+        tx /= tl; ty /= tl;
+        const raxt = rax * ty - ray * tx, rbxt = rbx * ty - rby * tx;
+        let jt = -tl / (1 / a.mass + 1 / b.mass + raxt * raxt / a.inertia + rbxt * rbxt / b.inertia);
+        jt = Math.max(-0.3 * jn, Math.min(0.3 * jn, jt));
+        a.vx += jt * tx / a.mass; a.vy += jt * ty / a.mass; a.w += raxt * jt / a.inertia;
+        b.vx -= jt * tx / b.mass; b.vy -= jt * ty / b.mass; b.w -= rbxt * jt / b.inertia;
+      }
+      // lekkie rozsunięcie, żeby kawałki nie wchodziły w siebie
+      const sa = b.mass / (a.mass + b.mass);
+      a.x += nx * 0.8 * sa; a.y += ny * 0.8 * sa;
+      b.x -= nx * 0.8 * (1 - sa); b.y -= ny * 0.8 * (1 - sa);
+      if (-vn > 120 && now - lastClink > 0.04) { lastClink = now; clink(Math.min(1, -vn / 600) * 0.35); }
+    }
+  }
+}
+
+// cichy brzęk szkła o szkło
+function clink(g) {
+  if (!AC) return;
+  ping(0, rnd(3000, 8000), rnd(0.04, 0.12), rnd(0.02, 0.05) * g * 2);
+  nb(0, rnd(0.004, 0.008), 'highpass', rnd(4000, 8000), 1, 0.12 * g);
+}
+
+// palec podrzuca i odpycha tylko odłamki, których faktycznie dotknie; pts to punkty pod palcem.
+// Samo dotknięcie (fv nieokreślone) odpycha od palca z siłą pushForce. Przy przesuwaniu
+// odłamek dostaje prędkość palca (fv, px/s) razy pushGain w kierunku ruchu (ux, uy),
+// więc szybki ruch odrzuca go daleko, a powolny tylko przesuwa.
+function pushShards(pts, fv, ux, uy) {
+  const R = CFG.finger, now = nowS();
+  const offs = [[0, 0, 1], [R, 0, 0.6], [-R, 0, 0.6], [0, R, 0.6], [0, -R, 0.6]];
+  const drag = fv !== undefined;
+  const target = drag ? Math.min(CFG.pushMax, fv * CFG.pushGain) : CFG.pushForce;
+  const loud = drag ? Math.min(1, fv / 1500) : 1;
+  let n = 0;
   for (const s of shards) {
     if (s.dead) continue;
-    if (now >= s.delay) {
-      s.vy += CFG.gravity * s.g * dt;
-      s.x += s.vx * dt;
-      s.y += s.vy * dt;
-      s.rot += s.w * dt;
-      if (s.y - s.r > H + 30) { s.dead = true; continue; }
+    let k = 0, hx = 0, hy = 0;
+    for (const p of pts) {
+      for (const o of offs) {
+        if (o[2] <= k || !shardAt(s, p[0] + o[0], p[1] + o[1])) continue;
+        k = o[2]; hx = p[0]; hy = p[1];
+      }
     }
-    alive++;
-    ctx.save();
-    ctx.translate(s.x, s.y);
-    ctx.rotate(s.rot);
-    ctx.drawImage(s.cv, s.bx - s.cx0, s.by - s.cy0, s.bw, s.bh);
-    ctx.restore();
+    if (!k) continue;
+    const dx = s.x - hx, dy = s.y - hy, d = Math.hypot(dx, dy) || 1;
+    const rx = dx / d, ry = dy / d;
+    if (drag) {
+      // prędkość wzdłuż ruchu palca podciągnięta do prędkości palca
+      // (nie sumuje się, gdy palec trzyma odłamek przez kilka ruchów)
+      const v = target * k, along = s.vx * ux + s.vy * uy;
+      if (along < v) { s.vx += (v - along) * ux; s.vy += (v - along) * uy; }
+      s.vx += rx * v * 0.15; s.vy += ry * v * 0.15;
+      s.vz = Math.max(s.vz, CFG.pushHop * k * Math.min(1, fv / 1000));
+      s.w += rnd(-1, 1) * Math.min(6, v / 250);
+    } else {
+      s.vx += rx * target * k;
+      s.vy += ry * target * k;
+      s.vz = Math.max(s.vz, CFG.pushHop * k);
+      s.w += rnd(-3, 3) * k;
+    }
+    s.pushed = true;
+    if (s.delay > now) s.delay = now;
+    if (now - (s.tp || 0) > 0.2) n++;   // dźwięk tylko dla świeżo trafionych
+    s.tp = now;
   }
-  if (!alive || now - shards.t0 > 4) endShatter();
+  if (n && AC && loud > 0.05) {
+    for (let i = 0; i < Math.min(6, n); i++) ping(rnd(0, 0.12), rnd(2500, 8000), rnd(0.05, 0.16), rnd(0.02, 0.05) * loud);
+    crackle(3, 0.08, 0.4 * loud);
+  }
+  kick();
 }
 
 function endShatter() {
@@ -709,9 +1190,9 @@ function frame() {
 
   if (shatterAt && now >= shatterAt) { shatterAt = 0; shatter(shX, shY, now); }
 
-  // płynne dochodzenie koloru do aktualnego nachylenia
-  tilt += (tiltTarget - tilt) * 0.15;
-  if (Math.abs(tiltTarget - tilt) < 0.003) tilt = tiltTarget;
+  // płynne dochodzenie światła do aktualnego pochylenia telefonu
+  lx += (ltx - lx) * 0.3; ly += (lty - ly) * 0.3; lz += (ltz - lz) * 0.3;
+  if (Math.abs(ltx - lx) + Math.abs(lty - ly) + Math.abs(ltz - lz) < 0.002) { lx = ltx; ly = lty; lz = ltz; }
 
   ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   ctx.globalCompositeOperation = 'source-over';
@@ -722,32 +1203,23 @@ function frame() {
     drawShards(now, dt);
   } else {
     ctx.drawImage(layer, 0, 0, W, H);
+    drawCracks(ctx, now);
     for (let i = impacts.length - 1; i >= 0; i--) {
       const im = impacts[i];
-      drawBuckets(ctx, im.b, now);
       drawFlash(im, now);
-      if (now > im.tEnd + 0.03 && (im.f0 < 0 || now - im.f0 > 0.3)) {
-        drawBuckets(lctx, im.b, Infinity);
-        impacts.splice(i, 1);
-      }
+      if (now > im.tEnd + 0.03 && (im.f0 < 0 || now - im.f0 > 0.3)) impacts.splice(i, 1);
     }
   }
-
-  // odcień z nachylenia: czerń zostaje czernią, pęknięcia dostają kolor i jasność
-  ctx.globalCompositeOperation = 'multiply';
-  ctx.fillStyle = tintCss(tilt);
-  ctx.fillRect(0, 0, W, H);
-  ctx.globalCompositeOperation = 'source-over';
 
   const fa = flashT ? now - flashT : 1;
   if (fa >= 0 && fa < 0.18) {
     ctx.globalCompositeOperation = 'lighter';
-    ctx.fillStyle = 'rgba(255,255,255,' + (0.18 * (1 - fa / 0.18)) + ')';
+    ctx.fillStyle = 'rgba(255,255,255,' + (0.12 * (1 - fa / 0.18)) + ')';
     ctx.fillRect(0, 0, W, H);
     ctx.globalCompositeOperation = 'source-over';
   }
 
-  if (impacts.length || shards || shatterAt || fa < 0.2 || tilt !== tiltTarget) kick(); else lastT = 0;
+  if (impacts.length || shards || shatterAt || fa < 0.2 || lightMoving()) kick(); else lastT = 0;
 }
 
 /* ---------- dźwięk (Web Audio, bez plików) ---------- */
@@ -910,6 +1382,7 @@ function addDamage(v, x, y) {
 function busy() { return !!(shards || shatterAt); }
 
 function tap(x, y) {
+  if (shards) { pushShards([[x, y]]); return; }
   if (busy()) return;
   hideHint();
   spawnStar(x, y, {
@@ -929,6 +1402,15 @@ function drag(x0, y0, x1, y1, speed) {
   spawnTrail(x0, y0, x1, y1);
   scratchSound(speed);
   addDamage(CFG.trailDamage, x1, y1);
+}
+
+// przesunięcie palca po odłamkach: punkty co kilka px wzdłuż ruchu, żeby nie przeskoczyć odłamka
+function sweepShards(x0, y0, x1, y1, fv) {
+  const l = Math.hypot(x1 - x0, y1 - y0) || 1;
+  const pts = [];
+  for (let d = 0; d <= l; d += 8) pts.push([x0 + (x1 - x0) * d / l, y0 + (y1 - y0) * d / l]);
+  pts.push([x1, y1]);
+  pushShards(pts, fv, (x1 - x0) / l, (y1 - y0) / l);
 }
 
 function miniStar(x, y) {
@@ -952,7 +1434,7 @@ cv.addEventListener('pointerdown', (e) => {
   try { cv.setPointerCapture(e.pointerId); } catch (err) {}
   ptrs.set(e.pointerId, {
     x: e.clientX, y: e.clientY, lx: e.clientX, ly: e.clientY,
-    step: rnd(32, 58), star: 0, nextStar: rnd(200, 320), t: performance.now()
+    step: rnd(32, 58), star: 0, nextStar: rnd(200, 320), t: performance.now(), v: 0
   });
   tap(e.clientX, e.clientY);
 });
@@ -964,6 +1446,14 @@ cv.addEventListener('pointermove', (e) => {
   const now = performance.now();
   const moved = Math.hypot(e.clientX - p.x, e.clientY - p.y);
   const speed = moved / Math.max(1, now - p.t) * 16 / 10;
+  // prędkość palca w px/s (wygładzona) do popychania odłamków
+  p.v = p.v * 0.4 + moved / Math.max(4, now - p.t) * 1000 * 0.6;
+  if (shards) {
+    if (moved > 0.5) sweepShards(p.x, p.y, e.clientX, e.clientY, p.v);
+    p.x = e.clientX; p.y = e.clientY; p.t = now;
+    p.lx = p.x; p.ly = p.y;
+    return;
+  }
   p.star += moved;
   p.x = e.clientX; p.y = e.clientY; p.t = now;
   if (Math.hypot(p.x - p.lx, p.y - p.ly) >= p.step) {
@@ -1004,11 +1494,6 @@ window.addEventListener('keydown', (e) => {
 // iOS odblokowuje dźwięk (i zgodę na czujniki ruchu) dopiero po zakończeniu gestu
 ['pointerup', 'touchend', 'click'].forEach((ev) =>
   window.addEventListener(ev, () => { initAudio(); initTilt(); }, { passive: true }));
-
-// Android i przeglądarki bez pytania o zgodę: czujnik działa od razu
-if (window.DeviceOrientationEvent && typeof window.DeviceOrientationEvent.requestPermission !== 'function') {
-  initTilt();
-}
 
 ['gesturestart', 'gesturechange', 'contextmenu', 'dblclick'].forEach((ev) =>
   document.addEventListener(ev, (e) => e.preventDefault()));
