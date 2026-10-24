@@ -1,0 +1,963 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Pęknięte Szkło</title>
+<style>
+/* Układ: jeden pełnoekranowy canvas na czarnym tle, delikatna wskazówka na środku. */
+:root {
+  --void: #000000;
+  --hint: #7b8791;
+  --font-ui: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  color-scheme: dark;
+}
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--void);
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+body {
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#glass {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  background: var(--void);
+  touch-action: none;
+}
+
+.hint {
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  text-align: center;
+  font: 500 12px/1 var(--font-ui);
+  letter-spacing: 0.4em;
+  padding-left: 0.4em;
+  text-transform: uppercase;
+  color: var(--hint);
+  opacity: 0;
+  transition: opacity 1.4s ease;
+  pointer-events: none;
+}
+
+.hint.on { opacity: 0.6; }
+
+@media (prefers-reduced-motion: reduce) {
+  .hint { transition: none; }
+}
+</style>
+</head>
+<body>
+<canvas id="glass" role="img" aria-label="Czarne szkło. Dotknij albo przesuń palcem, aby je stłuc."></canvas>
+<div id="hint" class="hint" aria-hidden="true">dotknij</div>
+
+<script>
+(() => {
+'use strict';
+
+/* ---------- ustawienia (tu możesz kręcić) ---------- */
+const CFG = {
+  limit: 14,          // ile "obrażeń" wytrzymuje szkło, zanim się rozsypie
+  tapDamage: 1,       // pojedyncze uderzenie
+  trailDamage: 0.18,  // odcinek pęknięcia za palcem
+  starDamage: 0.5,    // mały "wybuch" w trakcie przeciągania
+  hitStop: 0.9,       // szansa, że nowe pęknięcie urwie się na istniejącym (reszta: przecina je)
+  hitJoin: 0.3,       // szansa, że po dojściu do starego pęknięcia odgałęzi się dalej wzdłuż niego
+  gravity: 2400,      // px/s^2 dla odłamków
+  hintDelay: 3500     // po ilu ms bez dotyku pokazać "dotknij"
+};
+
+const cv = document.getElementById('glass');
+const ctx = cv.getContext('2d');
+const hint = document.getElementById('hint');
+
+const rnd = (a, b) => a + Math.random() * (b - a);
+const nowS = () => performance.now() / 1000;
+
+/* ---------- rozmiar i warstwa z utrwalonymi pęknięciami ---------- */
+let W = 0, H = 0, DPR = 1;
+let layer = null, lctx = null;
+
+function resize() {
+  const nw = window.innerWidth, nh = window.innerHeight;
+  const nd = Math.min(window.devicePixelRatio || 1, 3);
+  if (nw === W && nh === H && nd === DPR) return;
+  if (shards) return;
+  const old = layer, ow = W, oh = H;
+  W = nw; H = nh; DPR = nd;
+  cv.width = Math.round(W * DPR);
+  cv.height = Math.round(H * DPR);
+  layer = document.createElement('canvas');
+  layer.width = cv.width;
+  layer.height = cv.height;
+  lctx = layer.getContext('2d');
+  lctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  if (old && ow) { lctx.drawImage(old, 0, 0, W, H); rescaleStore(W / ow, H / oh); }
+  kick();
+}
+
+/* ---------- stan ---------- */
+const impacts = [];   // pęknięcia w trakcie rośnięcia
+let shards = null;    // odłamki po rozbiciu
+let damage = 0;
+let shatterAt = 0, shX = 0, shY = 0;
+let flashT = 0;
+let raf = 0, lastT = 0;
+
+function kick() { if (!raf) raf = requestAnimationFrame(frame); }
+
+/* ---------- generowanie pęknięć ---------- */
+const CORE_W = [1.7, 1.05, 0.6];
+const GLOW_W = [6.0, 3.6, 2.2];
+
+function newOut() { return [[], [], []]; }
+
+function pushSeg(out, s) {
+  const k = s.w > 1.45 ? 0 : (s.w > 0.85 ? 1 : 2);
+  out[k].push(s);
+}
+
+function angDiff(a, b) {
+  let d = a - b;
+  while (d > Math.PI) d -= 2 * Math.PI;
+  while (d < -Math.PI) d += 2 * Math.PI;
+  return Math.abs(d);
+}
+
+/* --- pamięć istniejących pęknięć: siatka do szybkich zapytań --- */
+const CELL = 48;
+const grid = new Map();
+const storeSegs = [];
+const tips = [];       // wolne końce pęknięć, które mogą rosnąć dalej
+let newTips = [];
+
+const gkey = (cx, cy) => (cx + 8) * 4096 + (cy + 8);
+
+function gridAdd(s) {
+  const x0 = Math.floor(Math.min(s.x1, s.x2) / CELL), x1 = Math.floor(Math.max(s.x1, s.x2) / CELL);
+  const y0 = Math.floor(Math.min(s.y1, s.y2) / CELL), y1 = Math.floor(Math.max(s.y1, s.y2) / CELL);
+  for (let cx = x0; cx <= x1; cx++) {
+    for (let cy = y0; cy <= y1; cy++) {
+      const k = gkey(cx, cy);
+      let a = grid.get(k);
+      if (!a) { a = []; grid.set(k, a); }
+      a.push(s);
+    }
+  }
+}
+
+function clearStore() {
+  grid.clear();
+  storeSegs.length = 0;
+  tips.length = 0;
+  newTips = [];
+}
+
+function rescaleStore(sx, sy) {
+  grid.clear();
+  for (const s of storeSegs) {
+    s.x1 *= sx; s.x2 *= sx; s.y1 *= sy; s.y2 *= sy;
+    gridAdd(s);
+  }
+  for (const t of tips) { t.x *= sx; t.y *= sy; }
+}
+
+// pierwszy punkt przecięcia odcinka z istniejącymi pęknięciami
+function findHit(x1, y1, x2, y2, ox, oy, minD) {
+  const cx0 = Math.floor(Math.min(x1, x2) / CELL), cx1 = Math.floor(Math.max(x1, x2) / CELL);
+  const cy0 = Math.floor(Math.min(y1, y2) / CELL), cy1 = Math.floor(Math.max(y1, y2) / CELL);
+  const rx = x2 - x1, ry = y2 - y1;
+  let best = null, bt = 2;
+  for (let cx = cx0; cx <= cx1; cx++) {
+    for (let cy = cy0; cy <= cy1; cy++) {
+      const a = grid.get(gkey(cx, cy));
+      if (!a) continue;
+      for (let i = 0; i < a.length; i++) {
+        const s = a[i];
+        const sx = s.x2 - s.x1, sy = s.y2 - s.y1;
+        const den = rx * sy - ry * sx;
+        if (den === 0) continue;
+        const qx = s.x1 - x1, qy = s.y1 - y1;
+        const t = (qx * sy - qy * sx) / den;
+        const u = (qx * ry - qy * rx) / den;
+        if (t <= 0.001 || t > 1 || u < 0 || u > 1 || t >= bt) continue;
+        const hx = x1 + rx * t, hy = y1 + ry * t;
+        if (Math.hypot(hx - ox, hy - oy) < minD) continue;
+        bt = t;
+        best = { x: hx, y: hy, seg: s };
+      }
+    }
+  }
+  return best;
+}
+
+// najbliższe istniejące pęknięcia wokół punktu, z różnych stron
+function nearestCracks(x, y, R, maxN) {
+  if (!maxN || !storeSegs.length) return [];
+  const cx0 = Math.floor((x - R) / CELL), cx1 = Math.floor((x + R) / CELL);
+  const cy0 = Math.floor((y - R) / CELL), cy1 = Math.floor((y + R) / CELL);
+  const cand = [];
+  for (let cx = cx0; cx <= cx1; cx++) {
+    for (let cy = cy0; cy <= cy1; cy++) {
+      const a = grid.get(gkey(cx, cy));
+      if (!a) continue;
+      for (let i = 0; i < a.length; i++) {
+        const s = a[i];
+        const dx = s.x2 - s.x1, dy = s.y2 - s.y1;
+        const l2 = dx * dx + dy * dy || 1;
+        let u = ((x - s.x1) * dx + (y - s.y1) * dy) / l2;
+        u = Math.max(0, Math.min(1, u));
+        const px = s.x1 + dx * u, py = s.y1 + dy * u;
+        const d = Math.hypot(px - x, py - y);
+        if (d < 10 || d > R) continue;
+        cand.push({ d, x: px, y: py, ang: Math.atan2(py - y, px - x) });
+      }
+    }
+  }
+  cand.sort((a, b) => a.d - b.d);
+  const picked = [];
+  for (const c of cand) {
+    if (picked.length >= maxN) break;
+    if (picked.every((p) => angDiff(p.ang, c.ang) > 0.55)) picked.push(c);
+  }
+  return picked;
+}
+
+// nowe pęknięcie dochodzi do starego i rozgałęzia się dalej wzdłuż niego
+function joinBranch(out, hit, a, t, speed, w, depth) {
+  const s = hit.seg;
+  const u = rnd(0.1, 0.9);
+  const bx = s.x1 + (s.x2 - s.x1) * u, by = s.y1 + (s.y2 - s.y1) * u;
+  const ca = Math.atan2(s.y2 - s.y1, s.x2 - s.x1);
+  const along = angDiff(a, ca) < Math.PI / 2 ? ca : ca + Math.PI;
+  const side = Math.random() < 0.5 ? -1 : 1;
+  growPath(out, bx, by, along + side * rnd(0.3, 0.9), rnd(40, 130),
+           t + 0.01, speed, Math.max(0.9, w), depth + 1, null);
+}
+
+function growPath(out, x, y, ang, len, t, speed, w0, depth, collect) {
+  let d = 0, px = x, py = y, a = ang, ended = false;
+  const pts = collect ? [{ x, y, d: 0, t }] : null;
+  while (d < len) {
+    const step = rnd(10, 26);
+    a += rnd(-0.2, 0.2);
+    const nx = px + Math.cos(a) * step;
+    const ny = py + Math.sin(a) * step;
+    const wt = Math.max(0.35, w0 * (1 - (d / len) * 0.75));
+
+    const hit = findHit(px, py, nx, ny, x, y, 7);
+    if (hit) {
+      const r = Math.random();
+      if (r < CFG.hitStop) {
+        const l = Math.hypot(hit.x - px, hit.y - py);
+        pushSeg(out, { x1: px, y1: py, x2: hit.x, y2: hit.y, t0: t, t1: t + l / speed, w: wt });
+        t += l / speed;
+        if (pts) pts.push({ x: hit.x, y: hit.y, d: d + l, t });
+        if (r < CFG.hitJoin && depth < 2) joinBranch(out, hit, a, t, speed, wt, depth);
+        ended = true;
+        break;
+      }
+    }
+
+    pushSeg(out, { x1: px, y1: py, x2: nx, y2: ny, t0: t, t1: t + step / speed, w: wt });
+    d += step; t += step / speed; px = nx; py = ny;
+    if (pts) pts.push({ x: px, y: py, d, t });
+    if (depth < 2 && len - d > 40 && Math.random() < (depth === 0 ? 0.1 : 0.06)) {
+      const side = Math.random() < 0.5 ? -1 : 1;
+      growPath(out, px, py, a + side * rnd(0.35, 0.95), (len - d) * rnd(0.25, 0.55),
+               t, speed * 0.9, wt * 0.7, depth + 1, null);
+    }
+    if (px < -60 || px > W + 60 || py < -60 || py > H + 60) { ended = true; break; }
+  }
+  if (!ended) newTips.push({ x: px, y: py, ang: a, w: Math.max(0.5, w0 * 0.3) });
+  if (collect) collect.push(pts);
+}
+
+// promień celujący w konkretny punkt starego pęknięcia
+function growToward(out, x, y, tx, ty, t, speed, w0, collect) {
+  const L = Math.hypot(tx - x, ty - y) || 1;
+  const ang = Math.atan2(ty - y, tx - x);
+  const nxp = -Math.sin(ang), nyp = Math.cos(ang);
+  const pts = [{ x, y, d: 0, t }];
+  let d = 0, px = x, py = y;
+  while (d < L - 0.5) {
+    d = Math.min(L, d + rnd(10, 22));
+    const f = d / L;
+    const j = d >= L ? 0 : rnd(-1, 1) * 5 * (1 - f * 0.7);
+    const nx = d >= L ? tx : x + (tx - x) * f + nxp * j;
+    const ny = d >= L ? ty : y + (ty - y) * f + nyp * j;
+    const l = Math.hypot(nx - px, ny - py) || 1;
+    const wt = Math.max(0.45, w0 * (1 - f * 0.6));
+    pushSeg(out, { x1: px, y1: py, x2: nx, y2: ny, t0: t, t1: t + l / speed, w: wt });
+    t += l / speed; px = nx; py = ny;
+    pts.push({ x: px, y: py, d, t });
+  }
+  collect.push(pts);
+}
+
+// stare końcówki w pobliżu uderzenia pękają dalej, lekko w jego stronę
+function extendTips(x, y, T0, out, maxN) {
+  if (!maxN) return;
+  const R = Math.min(0.5 * Math.hypot(W, H), 320);
+  let n = 0;
+  for (let i = tips.length - 1; i >= 0 && n < maxN; i--) {
+    const tp = tips[i];
+    const d = Math.hypot(tp.x - x, tp.y - y);
+    if (d > R || d < 12) continue;
+    if (Math.random() > 0.8 * (1 - d / R) + 0.1) continue;
+    const toward = Math.atan2(y - tp.y, x - tp.x);
+    let diff = toward - tp.ang;
+    while (diff > Math.PI) diff -= 2 * Math.PI;
+    while (diff < -Math.PI) diff += 2 * Math.PI;
+    const ang = tp.ang + diff * 0.3 + rnd(-0.15, 0.15);
+    const len = rnd(40, 150) * (1 - 0.5 * d / R);
+    tips.splice(i, 1);
+    growPath(out, tp.x, tp.y, ang, len, T0 + d / 3000, rnd(2200, 3000),
+             Math.max(0.9, tp.w * 1.5), 1, null);
+    n++;
+  }
+}
+
+function pointAtD(pts, d) {
+  for (let i = 1; i < pts.length; i++) {
+    if (pts[i].d >= d) {
+      const a = pts[i - 1], b = pts[i];
+      const f = (d - a.d) / ((b.d - a.d) || 1);
+      return { x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f, t: a.t + (b.t - a.t) * f };
+    }
+  }
+  return null;
+}
+
+// odcinek pierścienia urywa się na istniejącym pęknięciu
+function pushClipped(out, x1, y1, x2, y2, t0, dur, w) {
+  const hit = findHit(x1, y1, x2, y2, x1, y1, 0);
+  if (hit) {
+    const f = Math.hypot(hit.x - x1, hit.y - y1) / (Math.hypot(x2 - x1, y2 - y1) || 1);
+    pushSeg(out, { x1, y1, x2: hit.x, y2: hit.y, t0, t1: t0 + Math.max(0.005, dur * f), w });
+    return true;
+  }
+  pushSeg(out, { x1, y1, x2, y2, t0, t1: t0 + dur, w });
+  return false;
+}
+
+function register(out, x, y, flash) {
+  let tEnd = 0;
+  for (let k = 0; k < 3; k++) {
+    for (const s of out[k]) {
+      if (s.t1 > tEnd) tEnd = s.t1;
+      gridAdd(s);
+      storeSegs.push(s);
+    }
+  }
+  for (const tp of newTips) tips.push(tp);
+  newTips = [];
+  if (tips.length > 400) tips.splice(0, tips.length - 400);
+  impacts.push({ b: out, tEnd, x, y, f0: flash ? nowS() : -1 });
+  kick();
+}
+
+function haze(x, y, r, a) {
+  const g = lctx.createRadialGradient(x, y, 0, x, y, r);
+  g.addColorStop(0, 'rgba(200,235,255,' + a + ')');
+  g.addColorStop(1, 'rgba(200,235,255,0)');
+  lctx.globalCompositeOperation = 'lighter';
+  lctx.fillStyle = g;
+  lctx.fillRect(x - r, y - r, 2 * r, 2 * r);
+  lctx.globalCompositeOperation = 'source-over';
+}
+
+function spawnStar(x, y, o) {
+  const out = newOut(), rays = [];
+  const T0 = nowS();
+  const diag = Math.hypot(W, H);
+  const n = o.rays;
+  const base = Math.random() * Math.PI * 2;
+  const angs = [];
+  for (let i = 0; i < n; i++) angs.push(base + i * (Math.PI * 2 / n) + rnd(-0.22, 0.22));
+
+  // część promieni celuje w najbliższe istniejące pęknięcia i się z nimi łączy
+  const linkFor = new Map();
+  const targets = nearestCracks(x, y, Math.min(0.38 * diag, 300), o.links || 0)
+    .filter((c, i) => i === 0 || Math.random() < (i === 1 ? 0.7 : 0.45));
+  for (const c of targets) {
+    let bi = -1, bd = 9;
+    for (let i = 0; i < n; i++) {
+      if (linkFor.has(i)) continue;
+      const dd = angDiff(angs[i], c.ang);
+      if (dd < bd) { bd = dd; bi = i; }
+    }
+    if (bi >= 0) linkFor.set(bi, c);
+  }
+
+  let maxLen = 0;
+  for (let i = 0; i < n; i++) {
+    const c = linkFor.get(i);
+    if (c) {
+      if (c.d > maxLen) maxLen = c.d;
+      growToward(out, x, y, c.x, c.y, T0, rnd(2200, 3600), o.w, rays);
+    } else {
+      const len = diag * rnd(o.lenMin, o.lenMax);
+      if (len > maxLen) maxLen = len;
+      growPath(out, x, y, angs[i], len, T0, rnd(2200, 3600), o.w, 0, rays);
+    }
+  }
+
+  // stare końcówki w okolicy dostają "impuls" i rosną dalej
+  extendTips(x, y, T0, out, o.ext || 0);
+
+  // pierścienie łączące sąsiednie promienie
+  let r = rnd(o.ringStart[0], o.ringStart[1]);
+  while (r < maxLen * 0.95) {
+    const ps = rays.map((pts) => pointAtD(pts, r * rnd(0.94, 1.06)));
+    for (let i = 0; i < n; i++) {
+      const a = ps[i], b = ps[(i + 1) % n];
+      if (!a || !b || Math.random() > 0.72) continue;
+      const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const chord = Math.hypot(dx, dy) || 1;
+      const off = rnd(-1, 1) * 0.08 * chord;
+      const m = { x: mx - dy / chord * off, y: my + dx / chord * off };
+      const t = Math.max(a.t, b.t) + 0.005;
+      const w = o.w * 0.38;
+      if (!pushClipped(out, a.x, a.y, m.x, m.y, t, 0.04, w)) {
+        pushClipped(out, m.x, m.y, b.x, b.y, t + 0.04, 0.04, w);
+      }
+    }
+    r *= rnd(1.5, 1.85);
+  }
+
+  // zmiażdżony punkt uderzenia
+  for (let k = 0; k < 9; k++) {
+    const a = Math.random() * Math.PI * 2, l = rnd(4, 15);
+    pushSeg(out, { x1: x, y1: y, x2: x + Math.cos(a) * l, y2: y + Math.sin(a) * l,
+                   t0: T0, t1: T0 + 0.02, w: 1.6 });
+  }
+  if (o.haze) haze(x, y, o.haze, 0.06);
+  register(out, x, y, o.flash);
+}
+
+function spawnTrail(x0, y0, x1, y1) {
+  const out = newOut();
+  const dx = x1 - x0, dy = y1 - y0;
+  const L = Math.hypot(dx, dy) || 1;
+  const ang = Math.atan2(dy, dx);
+  const speed = 3200;
+  let px = x0, py = y0, d = 0, t = nowS();
+  while (d < L) {
+    const step = Math.min(rnd(8, 16), L - d);
+    d += step;
+    const nx = x0 + dx * (d / L) + rnd(-3.5, 3.5);
+    const ny = y0 + dy * (d / L) + rnd(-3.5, 3.5);
+    pushSeg(out, { x1: px, y1: py, x2: nx, y2: ny, t0: t, t1: t + step / speed, w: 1.5 });
+    t += step / speed;
+    if (Math.random() < 0.14) {
+      growPath(out, nx, ny, ang + (Math.random() < 0.5 ? -1 : 1) * rnd(0.5, 1.2),
+               rnd(30, 95), t, 2400, 1.0, 1, null);
+    }
+    px = nx; py = ny;
+  }
+  newTips.push({ x: px, y: py, ang, w: 1.0 });
+  register(out, x1, y1, false);
+}
+
+/* ---------- rysowanie pęknięć ---------- */
+function drawBuckets(c, b, now) {
+  c.lineCap = 'round';
+  c.lineJoin = 'round';
+  for (let pass = 0; pass < 2; pass++) {
+    c.globalCompositeOperation = pass === 0 ? 'lighter' : 'source-over';
+    c.strokeStyle = pass === 0 ? 'rgba(110,195,255,0.10)' : 'rgba(238,249,255,0.92)';
+    for (let k = 0; k < 3; k++) {
+      const arr = b[k];
+      if (!arr.length) continue;
+      c.lineWidth = pass === 0 ? GLOW_W[k] : CORE_W[k];
+      c.beginPath();
+      let any = false;
+      for (let i = 0; i < arr.length; i++) {
+        const s = arr[i];
+        if (now <= s.t0) continue;
+        const f = now >= s.t1 ? 1 : (now - s.t0) / (s.t1 - s.t0);
+        c.moveTo(s.x1, s.y1);
+        c.lineTo(s.x1 + (s.x2 - s.x1) * f, s.y1 + (s.y2 - s.y1) * f);
+        any = true;
+      }
+      if (any) c.stroke();
+    }
+  }
+  c.globalCompositeOperation = 'source-over';
+}
+
+function drawFlash(im, now) {
+  if (im.f0 < 0) return;
+  const age = now - im.f0;
+  if (age < 0 || age > 0.3) return;
+  const k = 1 - age / 0.3, a = k * k, r = 45 + age * 260;
+  const g = ctx.createRadialGradient(im.x, im.y, 0, im.x, im.y, r);
+  g.addColorStop(0, 'rgba(255,255,255,' + (0.65 * a) + ')');
+  g.addColorStop(0.35, 'rgba(150,215,255,' + (0.2 * a) + ')');
+  g.addColorStop(1, 'rgba(150,215,255,0)');
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.fillStyle = g;
+  ctx.fillRect(im.x - r, im.y - r, 2 * r, 2 * r);
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+/* ---------- rozbicie: odłamki jako komórki Voronoia ---------- */
+function clipHalf(poly, a, b, c) {
+  const out = [];
+  const n = poly.length;
+  for (let i = 0; i < n; i++) {
+    const p = poly[i], q = poly[(i + 1) % n];
+    const dp = a * p[0] + b * p[1] - c, dq = a * q[0] + b * q[1] - c;
+    if (dp <= 0) out.push(p);
+    if ((dp < 0 && dq > 0) || (dp > 0 && dq < 0)) {
+      const t = dp / (dp - dq);
+      out.push([p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t]);
+    }
+  }
+  return out;
+}
+
+function shatter(cx, cy, now) {
+  for (const im of impacts) drawBuckets(lctx, im.b, Infinity);
+  impacts.length = 0;
+
+  const N = Math.max(40, Math.min(80, Math.round(W * H / 9000)));
+  const maxR = Math.hypot(Math.max(cx, W - cx), Math.max(cy, H - cy));
+  const seeds = [[cx, cy]];
+  let guard = 0;
+  while (seeds.length < N && guard++ < 3000) {
+    const r = maxR * Math.pow(Math.random(), 1.6), a = Math.random() * Math.PI * 2;
+    const sx = cx + Math.cos(a) * r, sy = cy + Math.sin(a) * r;
+    if (sx >= 0 && sx <= W && sy >= 0 && sy <= H) seeds.push([sx, sy]);
+  }
+
+  shards = [];
+  for (let i = 0; i < seeds.length; i++) {
+    let poly = [[0, 0], [W, 0], [W, H], [0, H]];
+    const si = seeds[i];
+    for (let j = 0; j < seeds.length && poly.length >= 3; j++) {
+      if (j === i) continue;
+      const sj = seeds[j];
+      poly = clipHalf(poly, 2 * (sj[0] - si[0]), 2 * (sj[1] - si[1]),
+                      sj[0] * sj[0] + sj[1] * sj[1] - si[0] * si[0] - si[1] * si[1]);
+    }
+    if (poly.length < 3) continue;
+
+    let minX = 1e9, minY = 1e9, maxX = -1e9, maxY = -1e9, ax = 0, ay = 0;
+    for (const p of poly) {
+      if (p[0] < minX) minX = p[0];
+      if (p[1] < minY) minY = p[1];
+      if (p[0] > maxX) maxX = p[0];
+      if (p[1] > maxY) maxY = p[1];
+      ax += p[0]; ay += p[1];
+    }
+    ax /= poly.length; ay /= poly.length;
+    minX -= 1; minY -= 1; maxX += 1; maxY += 1;
+    const bw = maxX - minX, bh = maxY - minY;
+
+    const sc = document.createElement('canvas');
+    sc.width = Math.max(1, Math.ceil(bw * DPR));
+    sc.height = Math.max(1, Math.ceil(bh * DPR));
+    const c = sc.getContext('2d');
+    c.setTransform(DPR, 0, 0, DPR, -minX * DPR, -minY * DPR);
+    c.beginPath();
+    poly.forEach((p, k) => (k ? c.lineTo(p[0], p[1]) : c.moveTo(p[0], p[1])));
+    c.closePath();
+    c.save();
+    c.clip();
+    c.fillStyle = 'rgba(160,215,255,' + rnd(0.05, 0.11) + ')';
+    c.fillRect(minX, minY, bw, bh);
+    c.drawImage(layer, 0, 0, W, H);
+    c.restore();
+    c.lineJoin = 'round';
+    c.lineWidth = 1.4;
+    c.strokeStyle = 'rgba(225,242,255,0.7)';
+    c.stroke();
+
+    const dist = Math.hypot(ax - cx, ay - cy);
+    let dx = ax - cx, dy = ay - cy;
+    const dl = Math.hypot(dx, dy) || 1;
+    dx /= dl; dy /= dl;
+    const v0 = Math.min(900, (120 + 14000 / (dist + 60)) * rnd(0.6, 1.2));
+    shards.push({
+      cv: sc, bx: minX, by: minY, bw, bh, cx0: ax, cy0: ay,
+      x: ax, y: ay, rot: 0,
+      vx: dx * v0 + rnd(-40, 40),
+      vy: dy * v0 + rnd(-140, 30),
+      w: rnd(-3, 3) * (1 + 80 / (dist + 80)),
+      g: rnd(0.85, 1.15),
+      delay: now + 0.04 + (dist / maxR) * 0.22 + rnd(0, 0.08),
+      r: Math.hypot(bw, bh) / 2,
+      dead: false
+    });
+  }
+  shards.t0 = now;
+  flashT = now;
+  shatterSound();
+  vib([30, 40, 30, 40, 90]);
+}
+
+function drawShards(now, dt) {
+  let alive = 0;
+  for (const s of shards) {
+    if (s.dead) continue;
+    if (now >= s.delay) {
+      s.vy += CFG.gravity * s.g * dt;
+      s.x += s.vx * dt;
+      s.y += s.vy * dt;
+      s.rot += s.w * dt;
+      if (s.y - s.r > H + 30) { s.dead = true; continue; }
+    }
+    alive++;
+    ctx.save();
+    ctx.translate(s.x, s.y);
+    ctx.rotate(s.rot);
+    ctx.drawImage(s.cv, s.bx - s.cx0, s.by - s.cy0, s.bw, s.bh);
+    ctx.restore();
+  }
+  if (!alive || now - shards.t0 > 4) endShatter();
+}
+
+function endShatter() {
+  shards = null;
+  lctx.clearRect(0, 0, W, H);
+  impacts.length = 0;
+  clearStore();
+  damage = 0;
+  shatterAt = 0;
+  armHint();
+}
+
+/* ---------- pętla ---------- */
+function frame() {
+  raf = 0;
+  const now = nowS();
+  const dt = Math.min(0.05, lastT ? now - lastT : 0.016);
+  lastT = now;
+
+  if (shatterAt && now >= shatterAt) { shatterAt = 0; shatter(shX, shY, now); }
+
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+
+  if (shards) {
+    drawShards(now, dt);
+  } else {
+    ctx.drawImage(layer, 0, 0, W, H);
+    for (let i = impacts.length - 1; i >= 0; i--) {
+      const im = impacts[i];
+      drawBuckets(ctx, im.b, now);
+      drawFlash(im, now);
+      if (now > im.tEnd + 0.03 && (im.f0 < 0 || now - im.f0 > 0.3)) {
+        drawBuckets(lctx, im.b, Infinity);
+        impacts.splice(i, 1);
+      }
+    }
+  }
+
+  const fa = flashT ? now - flashT : 1;
+  if (fa >= 0 && fa < 0.18) {
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = 'rgba(255,255,255,' + (0.22 * (1 - fa / 0.18)) + ')';
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  if (impacts.length || shards || shatterAt || fa < 0.2) kick(); else lastT = 0;
+}
+
+/* ---------- dźwięk (Web Audio, bez plików) ---------- */
+let AC = null, master = null, noiseBuf = null, iosDone = false;
+
+function unlockIOS() {
+  if (iosDone) return;
+  iosDone = true;
+  try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
+  try {
+    const rate = 8000, n = 800;
+    const buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+    const wr = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    wr(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); wr(8, 'WAVE'); wr(12, 'fmt ');
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true);
+    v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    wr(36, 'data'); v.setUint32(40, n * 2, true);
+    const a = new Audio(URL.createObjectURL(new Blob([buf], { type: 'audio/wav' })));
+    a.loop = true;
+    a.setAttribute('playsinline', '');
+    const p = a.play();
+    if (p && p.catch) p.catch(() => {});
+  } catch (e) {}
+}
+
+function initAudio() {
+  try {
+    if (!AC) {
+      const Ctor = window.AudioContext || window.webkitAudioContext;
+      if (!Ctor) return;
+      AC = new Ctor();
+      const comp = AC.createDynamicsCompressor();
+      comp.threshold.value = -14; comp.knee.value = 18; comp.ratio.value = 6;
+      comp.attack.value = 0.002; comp.release.value = 0.12;
+      master = AC.createGain();
+      master.gain.value = 0.9;
+      master.connect(comp);
+      comp.connect(AC.destination);
+      const len = AC.sampleRate * 2;
+      noiseBuf = AC.createBuffer(1, len, AC.sampleRate);
+      const d = noiseBuf.getChannelData(0);
+      for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    }
+    if (AC.state !== 'running') {
+      const p = AC.resume();
+      if (p && p.catch) p.catch(() => {});
+    }
+    unlockIOS();
+  } catch (e) {}
+}
+
+function nb(t, dur, type, freq, q, gain, attack, endFreq) {
+  if (!AC) return;
+  attack = attack || 0.001;
+  const t0 = AC.currentTime + t;
+  const src = AC.createBufferSource();
+  src.buffer = noiseBuf;
+  const f = AC.createBiquadFilter();
+  f.type = type;
+  f.frequency.setValueAtTime(freq, t0);
+  if (endFreq) f.frequency.exponentialRampToValueAtTime(endFreq, t0 + dur);
+  f.Q.value = q;
+  const g = AC.createGain();
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.linearRampToValueAtTime(gain, t0 + attack);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  src.connect(f); f.connect(g); g.connect(master);
+  src.start(t0, Math.random() * (noiseBuf.duration - dur - 0.1));
+  src.stop(t0 + dur + 0.02);
+}
+
+function ping(t, freq, dur, gain, endFreq) {
+  if (!AC) return;
+  const t0 = AC.currentTime + t;
+  const o = AC.createOscillator();
+  o.type = 'sine';
+  o.frequency.setValueAtTime(freq, t0);
+  if (endFreq) o.frequency.exponentialRampToValueAtTime(endFreq, t0 + dur);
+  const g = AC.createGain();
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.linearRampToValueAtTime(gain, t0 + 0.003);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  o.connect(g); g.connect(master);
+  o.start(t0); o.stop(t0 + dur + 0.02);
+}
+
+function crackle(n, span, scale) {
+  for (let i = 0; i < n; i++) {
+    const t = span * Math.pow(i / n, 0.7) + rnd(0, 0.02);
+    nb(t, rnd(0.004, 0.012), 'bandpass', rnd(2500, 9000), rnd(1, 5),
+       rnd(0.1, 0.35) * scale * (1 - (i / n) * 0.5));
+  }
+}
+
+function hitSound(s) {
+  if (!AC) return;
+  nb(0, 0.08, 'lowpass', 650, 0.7, 0.5 * s);
+  ping(0, rnd(105, 150), 0.14, 0.38 * s, 45);
+  nb(0, 0.05, 'highpass', 2600, 0.7, 0.55 * s);
+  nb(0.002, 0.2, 'bandpass', rnd(4200, 7200), 2.2, 0.16 * s);
+  const base = rnd(1700, 2500);
+  [1, 1.47, 2.09, 2.76].forEach((m, i) => {
+    ping(0.004, base * m * rnd(0.98, 1.02), rnd(0.22, 0.55) / (1 + i * 0.4), 0.05 / (1 + i * 0.5));
+  });
+  crackle(9, 0.3, s);
+}
+
+let lastScratch = 0;
+function scratchSound(speed) {
+  if (!AC) return;
+  const t = performance.now();
+  if (t - lastScratch < 45) return;
+  lastScratch = t;
+  nb(0, 0.09, 'bandpass', rnd(3500, 6500), 2, 0.1 + Math.min(speed, 3) * 0.05, 0.004);
+  crackle(2 + Math.floor(Math.random() * 3), 0.08, 0.6);
+}
+
+function shatterSound() {
+  if (!AC) return;
+  ping(0, 140, 0.45, 0.6, 38);
+  nb(0, 0.55, 'lowpass', 2500, 0.5, 0.7, 0.002, 500);
+  nb(0, 0.35, 'highpass', 2000, 0.6, 0.7, 0.001);
+  nb(0, 0.9, 'bandpass', 6000, 0.8, 0.25, 0.01, 3000);
+  for (let i = 0; i < 46; i++) {
+    const t = Math.pow(Math.random(), 1.5) * 1.4 + 0.03;
+    ping(t, rnd(1800, 8800), rnd(0.05, 0.28), rnd(0.02, 0.08));
+    nb(t, rnd(0.005, 0.009), 'highpass', rnd(3000, 7000), 1, rnd(0.08, 0.22));
+  }
+}
+
+function vib(p) {
+  try { if (navigator.vibrate) navigator.vibrate(p); } catch (e) {}
+}
+
+/* ---------- wskazówka ---------- */
+let idleTimer = 0;
+function armHint() {
+  clearTimeout(idleTimer);
+  hint.classList.remove('on');
+  if (damage === 0 && !shards) {
+    idleTimer = setTimeout(() => hint.classList.add('on'), CFG.hintDelay);
+  }
+}
+function hideHint() {
+  clearTimeout(idleTimer);
+  hint.classList.remove('on');
+}
+
+/* ---------- akcje użytkownika ---------- */
+function addDamage(v, x, y) {
+  damage += v;
+  if (damage >= CFG.limit && !shatterAt && !shards) {
+    shatterAt = nowS() + 0.32;
+    shX = x; shY = y;
+    kick();
+  }
+}
+
+function busy() { return !!(shards || shatterAt); }
+
+function tap(x, y) {
+  if (busy()) return;
+  hideHint();
+  spawnStar(x, y, {
+    rays: 7 + Math.floor(Math.random() * 5),
+    lenMin: 0.3, lenMax: 0.72, w: 2.0,
+    ringStart: [26, 40], flash: true, haze: 90,
+    links: 3, ext: 6
+  });
+  hitSound(1);
+  vib(14);
+  addDamage(CFG.tapDamage, x, y);
+}
+
+function drag(x0, y0, x1, y1, speed) {
+  if (busy()) return;
+  hideHint();
+  spawnTrail(x0, y0, x1, y1);
+  scratchSound(speed);
+  addDamage(CFG.trailDamage, x1, y1);
+}
+
+function miniStar(x, y) {
+  if (busy()) return;
+  spawnStar(x, y, {
+    rays: 4 + Math.floor(Math.random() * 3),
+    lenMin: 0.08, lenMax: 0.2, w: 1.3,
+    ringStart: [14, 22], flash: true, haze: 40,
+    links: 1, ext: 2
+  });
+  hitSound(0.5);
+  vib(8);
+  addDamage(CFG.starDamage, x, y);
+}
+
+const ptrs = new Map();
+
+cv.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  initAudio();
+  try { cv.setPointerCapture(e.pointerId); } catch (err) {}
+  ptrs.set(e.pointerId, {
+    x: e.clientX, y: e.clientY, lx: e.clientX, ly: e.clientY,
+    step: rnd(32, 58), star: 0, nextStar: rnd(200, 320), t: performance.now()
+  });
+  tap(e.clientX, e.clientY);
+});
+
+cv.addEventListener('pointermove', (e) => {
+  const p = ptrs.get(e.pointerId);
+  if (!p) return;
+  e.preventDefault();
+  const now = performance.now();
+  const moved = Math.hypot(e.clientX - p.x, e.clientY - p.y);
+  const speed = moved / Math.max(1, now - p.t) * 16 / 10;
+  p.star += moved;
+  p.x = e.clientX; p.y = e.clientY; p.t = now;
+  if (Math.hypot(p.x - p.lx, p.y - p.ly) >= p.step) {
+    drag(p.lx, p.ly, p.x, p.y, speed);
+    p.lx = p.x; p.ly = p.y;
+    p.step = rnd(32, 58);
+    if (p.star >= p.nextStar) {
+      p.star = 0;
+      p.nextStar = rnd(200, 320);
+      miniStar(p.x, p.y);
+    }
+  }
+});
+
+const endPtr = (e) => { ptrs.delete(e.pointerId); };
+cv.addEventListener('pointerup', endPtr);
+cv.addEventListener('pointercancel', endPtr);
+
+let lastWheel = 0;
+cv.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  initAudio();
+  const t = performance.now();
+  if (t - lastWheel < 60) return;
+  lastWheel = t;
+  const dir = Math.sign(e.deltaY) || 1;
+  drag(e.clientX, e.clientY, e.clientX + rnd(-14, 14), e.clientY + dir * rnd(36, 60), 1.2);
+}, { passive: false });
+
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' || e.key === 'Enter') {
+    e.preventDefault();
+    initAudio();
+    tap(rnd(W * 0.15, W * 0.85), rnd(H * 0.15, H * 0.85));
+  }
+});
+
+// iOS odblokowuje dźwięk dopiero po zakończeniu gestu
+['pointerup', 'touchend', 'click'].forEach((ev) =>
+  window.addEventListener(ev, initAudio, { passive: true }));
+
+['gesturestart', 'gesturechange', 'contextmenu', 'dblclick'].forEach((ev) =>
+  document.addEventListener(ev, (e) => e.preventDefault()));
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && AC && AC.state !== 'running') initAudio();
+});
+
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 200));
+
+resize();
+armHint();
+})();
+</script>
+</body>
+</html>
