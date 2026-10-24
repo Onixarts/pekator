@@ -84,7 +84,9 @@ const CFG = {
   hitStop: 0.9,       // szansa, że nowe pęknięcie urwie się na istniejącym (reszta: przecina je)
   hitJoin: 0.3,       // szansa, że po dojściu do starego pęknięcia odgałęzi się dalej wzdłuż niego
   gravity: 2400,      // px/s^2 dla odłamków
-  hintDelay: 3500     // po ilu ms bez dotyku pokazać "dotknij"
+  hintDelay: 3500,    // po ilu ms bez dotyku pokazać "dotknij"
+  tiltNeutral: 60,    // kąt nachylenia telefonu (beta, w stopniach) przy neutralnym kolorze
+  tiltRange: 40       // ile stopni od neutralnego daje pełne ocieplenie / ochłodzenie
 };
 
 const cv = document.getElementById('glass');
@@ -123,12 +125,14 @@ let damage = 0;
 let shatterAt = 0, shX = 0, shY = 0;
 let flashT = 0;
 let raf = 0, lastT = 0;
+let tilt = 0, tiltTarget = 0;   // -1 = ekran w dół (cień, chłodno), 0 = neutralnie, 1 = ekran w górę (światło, ciepło)
 
 function kick() { if (!raf) raf = requestAnimationFrame(frame); }
 
 /* ---------- generowanie pęknięć ---------- */
-const CORE_W = [1.7, 1.05, 0.6];
-const GLOW_W = [6.0, 3.6, 2.2];
+// cieńsze linie niż wcześniej, żeby pęknięcie było bardziej jak na prawdziwym szkle
+const CORE_W = [1.4, 0.9, 0.5];
+const GLOW_W = [5.0, 3.0, 1.8];
 
 function newOut() { return [[], [], []]; }
 
@@ -453,7 +457,7 @@ function spawnStar(x, y, o) {
     pushSeg(out, { x1: x, y1: y, x2: x + Math.cos(a) * l, y2: y + Math.sin(a) * l,
                    t0: T0, t1: T0 + 0.02, w: 1.6 });
   }
-  if (o.haze) haze(x, y, o.haze, 0.06);
+  if (o.haze) haze(x, y, o.haze, 0.05);
   register(out, x, y, o.flash);
 }
 
@@ -482,12 +486,14 @@ function spawnTrail(x0, y0, x1, y1) {
 }
 
 /* ---------- rysowanie pęknięć ---------- */
+// Pęknięcia rysujemy w jednym, jasnym odcieniu. Właściwy kolor (zależny od nachylenia
+// telefonu) nakłada na końcu klatki mnożenie przez odcień, patrz tintCss i frame.
 function drawBuckets(c, b, now) {
   c.lineCap = 'round';
   c.lineJoin = 'round';
   for (let pass = 0; pass < 2; pass++) {
     c.globalCompositeOperation = pass === 0 ? 'lighter' : 'source-over';
-    c.strokeStyle = pass === 0 ? 'rgba(110,195,255,0.10)' : 'rgba(238,249,255,0.92)';
+    c.strokeStyle = pass === 0 ? 'rgba(110,195,255,0.08)' : 'rgba(236,247,255,0.72)';
     for (let k = 0; k < 3; k++) {
       const arr = b[k];
       if (!arr.length) continue;
@@ -514,13 +520,57 @@ function drawFlash(im, now) {
   if (age < 0 || age > 0.3) return;
   const k = 1 - age / 0.3, a = k * k, r = 45 + age * 260;
   const g = ctx.createRadialGradient(im.x, im.y, 0, im.x, im.y, r);
-  g.addColorStop(0, 'rgba(255,255,255,' + (0.65 * a) + ')');
-  g.addColorStop(0.35, 'rgba(150,215,255,' + (0.2 * a) + ')');
+  g.addColorStop(0, 'rgba(255,255,255,' + (0.55 * a) + ')');
+  g.addColorStop(0.35, 'rgba(150,215,255,' + (0.16 * a) + ')');
   g.addColorStop(1, 'rgba(150,215,255,0)');
   ctx.globalCompositeOperation = 'lighter';
   ctx.fillStyle = g;
   ctx.fillRect(im.x - r, im.y - r, 2 * r, 2 * r);
   ctx.globalCompositeOperation = 'source-over';
+}
+
+/* ---------- kolor zależny od nachylenia (światło pada z góry) ---------- */
+// Ekran skierowany w górę (telefon odchylony do tyłu) łapie światło: ciepło i jaśniej.
+// Ekran skierowany w dół (telefon pochylony do przodu) jest w cieniu: chłodno i ciemniej.
+const TINT_COOL = [112, 146, 204];
+const TINT_MID  = [196, 209, 223];
+const TINT_WARM = [255, 233, 192];
+
+function mixRGB(a, b, f) {
+  return [
+    Math.round(a[0] + (b[0] - a[0]) * f),
+    Math.round(a[1] + (b[1] - a[1]) * f),
+    Math.round(a[2] + (b[2] - a[2]) * f)
+  ];
+}
+
+function tintCss(n) {
+  const c = n < 0 ? mixRGB(TINT_MID, TINT_COOL, -n) : mixRGB(TINT_MID, TINT_WARM, n);
+  return 'rgb(' + c[0] + ',' + c[1] + ',' + c[2] + ')';
+}
+
+function onTilt(e) {
+  if (e.beta == null) return;
+  const n = (CFG.tiltNeutral - e.beta) / CFG.tiltRange;
+  tiltTarget = Math.max(-1, Math.min(1, n));
+  if (Math.abs(tiltTarget - tilt) > 0.004) kick();
+}
+
+let tiltAsked = false;
+function initTilt() {
+  if (tiltAsked) return;
+  const D = window.DeviceOrientationEvent;
+  if (!D) return;
+  if (typeof D.requestPermission === 'function') {
+    // iOS: zgodę wolno zapytać tylko z gestu użytkownika
+    tiltAsked = true;
+    D.requestPermission().then((r) => {
+      if (r === 'granted') window.addEventListener('deviceorientation', onTilt);
+    }).catch(() => { tiltAsked = false; });
+  } else {
+    tiltAsked = true;
+    window.addEventListener('deviceorientation', onTilt);
+  }
 }
 
 /* ---------- rozbicie: odłamki jako komórki Voronoia ---------- */
@@ -587,13 +637,13 @@ function shatter(cx, cy, now) {
     c.closePath();
     c.save();
     c.clip();
-    c.fillStyle = 'rgba(160,215,255,' + rnd(0.05, 0.11) + ')';
+    c.fillStyle = 'rgba(160,215,255,' + rnd(0.04, 0.09) + ')';
     c.fillRect(minX, minY, bw, bh);
     c.drawImage(layer, 0, 0, W, H);
     c.restore();
     c.lineJoin = 'round';
-    c.lineWidth = 1.4;
-    c.strokeStyle = 'rgba(225,242,255,0.7)';
+    c.lineWidth = 1.2;
+    c.strokeStyle = 'rgba(225,242,255,0.55)';
     c.stroke();
 
     const dist = Math.hypot(ax - cx, ay - cy);
@@ -659,6 +709,10 @@ function frame() {
 
   if (shatterAt && now >= shatterAt) { shatterAt = 0; shatter(shX, shY, now); }
 
+  // płynne dochodzenie koloru do aktualnego nachylenia
+  tilt += (tiltTarget - tilt) * 0.15;
+  if (Math.abs(tiltTarget - tilt) < 0.003) tilt = tiltTarget;
+
   ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   ctx.globalCompositeOperation = 'source-over';
   ctx.fillStyle = '#000';
@@ -679,15 +733,21 @@ function frame() {
     }
   }
 
+  // odcień z nachylenia: czerń zostaje czernią, pęknięcia dostają kolor i jasność
+  ctx.globalCompositeOperation = 'multiply';
+  ctx.fillStyle = tintCss(tilt);
+  ctx.fillRect(0, 0, W, H);
+  ctx.globalCompositeOperation = 'source-over';
+
   const fa = flashT ? now - flashT : 1;
   if (fa >= 0 && fa < 0.18) {
     ctx.globalCompositeOperation = 'lighter';
-    ctx.fillStyle = 'rgba(255,255,255,' + (0.22 * (1 - fa / 0.18)) + ')';
+    ctx.fillStyle = 'rgba(255,255,255,' + (0.18 * (1 - fa / 0.18)) + ')';
     ctx.fillRect(0, 0, W, H);
     ctx.globalCompositeOperation = 'source-over';
   }
 
-  if (impacts.length || shards || shatterAt || fa < 0.2) kick(); else lastT = 0;
+  if (impacts.length || shards || shatterAt || fa < 0.2 || tilt !== tiltTarget) kick(); else lastT = 0;
 }
 
 /* ---------- dźwięk (Web Audio, bez plików) ---------- */
@@ -941,9 +1001,14 @@ window.addEventListener('keydown', (e) => {
   }
 });
 
-// iOS odblokowuje dźwięk dopiero po zakończeniu gestu
+// iOS odblokowuje dźwięk (i zgodę na czujniki ruchu) dopiero po zakończeniu gestu
 ['pointerup', 'touchend', 'click'].forEach((ev) =>
-  window.addEventListener(ev, initAudio, { passive: true }));
+  window.addEventListener(ev, () => { initAudio(); initTilt(); }, { passive: true }));
+
+// Android i przeglądarki bez pytania o zgodę: czujnik działa od razu
+if (window.DeviceOrientationEvent && typeof window.DeviceOrientationEvent.requestPermission !== 'function') {
+  initTilt();
+}
 
 ['gesturestart', 'gesturechange', 'contextmenu', 'dblclick'].forEach((ev) =>
   document.addEventListener(ev, (e) => e.preventDefault()));
