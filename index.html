@@ -98,8 +98,11 @@ const CFG = {
   tapDamage: 1,       // pojedyncze uderzenie
   trailDamage: 0.2,   // odcinek pęknięcia za palcem
   starDamage: 0.5,    // mały "wybuch" w trakcie przeciągania
-  hitStop: 0.9,       // szansa, że nowe pęknięcie urwie się na istniejącym (reszta: przecina je)
+  hitStop: 0.8,       // szansa, że nowe pęknięcie urwie się na istniejącym (reszta: przecina je)
   hitJoin: 0.3,       // szansa, że po dojściu do starego pęknięcia odgałęzi się dalej wzdłuż niego
+  crushMin: 14,       // najmniejszy wgniot pod palcem (promień w px)
+  crushMax: 42,       // największy wgniot pod palcem (promień w px)
+  crushDensity: 0.9,  // gęstość wgniotu pod palcem: rys na każdy px promienia (więcej = gęstszy wgniot)
   slide: 4500,        // px/s^2: przyspieszenie zsuwania odłamków przy przechyle 90 stopni
   stick: 0.85,        // tarcie spoczynkowe (współczynnik): odłamek rusza, gdy tangens przechyłu > stick
   slideFric: 0.7,     // tarcie w ruchu (współczynnik, hamuje zsuwające się odłamki)
@@ -110,6 +113,8 @@ const CFG = {
   pushHop: 120,       // px/s: jak mocno palec podrzuca trafiony odłamek
   pushFric: 0.8,     // mnożnik tarcia w ruchu dla odłamka popchniętego palcem (mniej = dalej jedzie)
   bounce: 0.2,       // sprężystość zderzeń odłamków między sobą (0 = bez odbicia, 1 = pełne)
+  shakeDead: 0.6,     // m/s^2: martwa strefa ruchu telefonu (szum czujnika poniżej tego jest ignorowany)
+  tiltDead: 0.8,      // stopnie: drobniejsze zmiany pochylenia nie ruszają odłamków
   shake: 3.0,         // wzmocnienie reakcji na szarpnięcia, podrzuty i obroty telefonu
   hopGravity: 8600,   // px/s^2: jak szybko podskakujący odłamek opada z powrotem na ekran
   floorDelay: 0.45,   // s: po ilu sekundach odłamek, który wyjechał za ekran, uderza o podłogę
@@ -120,7 +125,7 @@ const CFG = {
   floorGapSmall: 0.6,      // mnożnik odstępu między odbiciami dla najmniejszego okruchu (mniej = szybciej)
   floorGapLarge: 2.2,      // mnożnik odstępu między odbiciami dla największego kawałka (więcej = wolniej)
   floorHigh: 5200,         // Hz: ton upadku najmniejszego okruchu
-  floorLow: 2100,           // Hz: ton upadku największego kawałka (większe = niższe)
+  floorLow: 2500,           // Hz: ton upadku największego kawałka (większe = niższe)
   floorPitch: 0.9,  // wysokość dźwięku upadku względem brzęku na ekranie (mniej = niżej)
   floorTone: 2800,    // Hz: filtr dolnoprzepustowy upadku (mniej = głuchszy, bardziej "z daleka")
   shardLife: 40,     // po ilu sekundach leżące odłamki same znikają
@@ -128,6 +133,9 @@ const CFG = {
   hintDelay: 3500,    // po ilu ms bez dotyku pokazać "dotknij"
   baseLight: 0.15,    // jasność linii bez odbicia (0..1), im mniej, tym ciemniej poza refleksami
   tiltGain: 1.7,      // ile razy wzmocnić pochylenie telefonu (większe = silniejsza reakcja)
+  glint: 0.6,         // siła refleksów świetlnych na odłamkach (0 = wyłączone)
+  glintRes: 0.5,      // rozdzielczość sprite'ów refleksów (0.3..1; mniej = lżej dla słabych telefonów)
+  glintShine: 100,     // ostrość refleksu odłamka: więcej = węższy, krótszy błysk przy obrocie
   shine: 14           // ostrość odbić: im więcej, tym węższy refleks i szybsza reakcja na pochylenie
 };
 
@@ -499,13 +507,52 @@ function spawnStar(x, y, o) {
     r *= rnd(1.5, 1.85);
   }
 
-  // zmiażdżony punkt uderzenia
-  for (let k = 0; k < 9; k++) {
-    const a = Math.random() * Math.PI * 2, l = rnd(4, 15);
-    pushSeg(out, { x1: x, y1: y, x2: x + Math.cos(a) * l, y2: y + Math.sin(a) * l,
-                   t0: T0, t1: T0 + 0.02, w: 1.6 });
+  // zmiażdżony punkt uderzenia: wgniot z wielu drobnych pęknięć wokół palca (promień o.crush):
+  // krótkie, poszarpane rysy w różne strony (część rozwidlona) i maleńkie łuki między nimi
+  const R = o.crush, nc = Math.round(R * CFG.crushDensity * rnd(0.4, 1.4));
+  for (let k = 0; k < nc; k++) {
+    const a = Math.random() * Math.PI * 2;
+    const r0 = R * rnd(0, 0.35) * (k % 3 ? 1 : 0), l = R * rnd(0.45, 1.05) * (k % 5 ? 1 : 1.35);
+    let px = x + Math.cos(a) * r0, py = y + Math.sin(a) * r0, aa = a;
+    const w = rnd(0.9, 1.7);
+    for (let s = 0; s < 2; s++) {
+      aa += rnd(-0.45, 0.45);
+      const sl = l * (s ? 0.45 : 0.55);
+      const nx = px + Math.cos(aa) * sl, ny = py + Math.sin(aa) * sl;
+      pushSeg(out, { x1: px, y1: py, x2: nx, y2: ny, t0: T0, t1: T0 + 0.03, w: w * (s ? 0.7 : 1) });
+      if (s === 0 && Math.random() < 0.5) {
+        const fa = aa + (Math.random() < 0.5 ? -1 : 1) * rnd(0.5, 1.0), fl = sl * rnd(0.5, 0.9);
+        pushSeg(out, { x1: nx, y1: ny, x2: nx + Math.cos(fa) * fl, y2: ny + Math.sin(fa) * fl,
+                       t0: T0 + 0.01, t1: T0 + 0.035, w: w * 0.6 });
+      }
+      px = nx; py = ny;
+    }
+  }
+  // łuki na krawędzi opuszka (jak na prawdziwym szkle): 1-3 długie, poszarpane łuki wokół
+  // wgniotu, czasem drugi, dalszy, plus krótkie poprzeczki wzdłuż łuku
+  const arcs = [[1.0, rnd(0.9, 2.4)]];
+  if (Math.random() < 0.7) arcs.push([1.0, rnd(0.5, 1.6)]);
+  if (Math.random() < 0.55) arcs.push([rnd(1.35, 1.8), rnd(0.5, 1.4)]);
+  for (const [f, span] of arcs) {
+    const a0 = Math.random() * Math.PI * 2, base = R * f * rnd(0.9, 1.1);
+    const steps = Math.max(3, Math.ceil(span * base / 7));
+    const w = rnd(0.9, 1.4);
+    let pa = a0, pr = base, px = x + Math.cos(pa) * pr, py = y + Math.sin(pa) * pr;
+    for (let i = 1; i <= steps; i++) {
+      const aa = a0 + span * i / steps, rr = base * rnd(0.94, 1.06);
+      const nx = x + Math.cos(aa) * rr, ny = y + Math.sin(aa) * rr;
+      const t0 = T0 + 0.01 + 0.04 * i / steps;
+      pushSeg(out, { x1: px, y1: py, x2: nx, y2: ny, t0, t1: t0 + 0.01, w });
+      if (i % 2 === 0 && Math.random() < 0.75) {
+        const dl = rnd(3, 9) * (R / 30 + 0.4), dir = Math.random() < 0.6 ? 1 : -1;
+        pushSeg(out, { x1: nx, y1: ny, x2: nx + Math.cos(aa) * dl * dir, y2: ny + Math.sin(aa) * dl * dir,
+                       t0, t1: t0 + 0.01, w: w * 0.7 });
+      }
+      px = nx; py = ny;
+    }
   }
   if (o.haze) haze(x, y, o.haze, 0.035);
+  haze(x, y, R * 1.3, 0.07);   // jasny wgniot pod palcem
   register(out, x, y, o.flash);
 }
 
@@ -642,11 +689,16 @@ function drawFlash(im, now) {
 // Kierunek "w górę" świata w układzie telefonu (x w prawo, y w górę ekranu, z do oczu):
 // u = (-sin(gamma) cos(beta), sin(beta), cos(gamma) cos(beta)). Światło pada z góry, więc L = u.
 let gotTilt = false;
+let physB = 55, physG = 0, physOk = false;
 let tiltB = 55, tiltG = 0;   // surowe kąty z czujnika (dla zsuwania odłamków); bez czujnika: trzymany pod 55 stopni
 function onTilt(e) {
   if (e.beta == null || e.gamma == null) return;
   if (!gotTilt) { gotTilt = true; sensorMsg(''); }
   tiltB = e.beta; tiltG = e.gamma;
+  // do fizyki odłamków tylko zmiany większe niż drobny szum czujnika (histereza), żeby leżały spokojnie
+  if (!physOk || Math.abs(e.beta - physB) > CFG.tiltDead || Math.abs(e.gamma - physG) > CFG.tiltDead) {
+    physB = e.beta; physG = e.gamma; physOk = true;
+  }
   // pochylenie liczone względem pozycji trzymania (55 stopni) i wzmocnione
   const bd = Math.max(-90, Math.min(180, 55 + (e.beta - 55) * CFG.tiltGain));
   const gd = Math.max(-80, Math.min(80, e.gamma * CFG.tiltGain));
@@ -665,9 +717,23 @@ window.addEventListener('deviceorientation', onTilt);
 // przyspieszenia kątowe w rad/s^2 liczone z różnicy kolejnych prędkości obrotu.
 let mAx = 0, mAy = 0, mAz = 0, mAlx = 0, mAly = 0, mAlz = 0, mWz = 0, mT = -1;
 let lastRR = null, lastRRt = 0;
+// Przeglądarki podają ruch różnie: część dodaje grawitację albo stałe przesunięcie do
+// "acceleration", a czujniki szumią. Dlatego odejmujemy wolno zmieniające się tło
+// (średnia ok. 0,4 s), a drobny szum ucinamy martwą strefą. Szarpnięcia i podrzuty zostają.
+let mBase = null, mBaseT = 0;
+const deadZone = (v, z) => (Math.abs(v) <= z ? 0 : v - Math.sign(v) * z);
 function onMotion(e) {
-  const a = e.acceleration;
-  if (a && a.x != null) { mAx = a.x; mAy = a.y; mAz = a.z || 0; }
+  const a = e.acceleration, t0 = e.timeStamp / 1000;
+  if (a && a.x != null) {
+    const v = [a.x, a.y || 0, a.z || 0];
+    if (!mBase) { mBase = v.slice(); mBaseT = t0; }
+    const k = 1 - Math.exp(-Math.max(0, t0 - mBaseT) / 0.4);
+    mBaseT = t0;
+    for (let i = 0; i < 3; i++) mBase[i] += (v[i] - mBase[i]) * k;
+    mAx = deadZone(v[0] - mBase[0], CFG.shakeDead);
+    mAy = deadZone(v[1] - mBase[1], CFG.shakeDead);
+    mAz = deadZone(v[2] - mBase[2], CFG.shakeDead);
+  }
   const r = e.rotationRate, t = e.timeStamp / 1000;
   if (r && r.alpha != null) {
     // beta: obrót wokół x, gamma: wokół y, alpha: wokół z (w stopniach na sekundę)
@@ -675,12 +741,12 @@ function onMotion(e) {
     if (lastRR && t > lastRRt) {
       const d = Math.max(0.008, t - lastRRt);
       const cl = (v) => Math.max(-300, Math.min(300, v));
-      mAlx = cl((cur[0] - lastRR[0]) / d);
-      mAly = cl((cur[1] - lastRR[1]) / d);
-      mAlz = cl((cur[2] - lastRR[2]) / d);
+      mAlx = deadZone(cl((cur[0] - lastRR[0]) / d), CFG.shakeDead * 3);
+      mAly = deadZone(cl((cur[1] - lastRR[1]) / d), CFG.shakeDead * 3);
+      mAlz = deadZone(cl((cur[2] - lastRR[2]) / d), CFG.shakeDead * 3);
     }
     lastRR = cur; lastRRt = t;
-    mWz = cur[2];
+    mWz = deadZone(cur[2], 0.15);
   }
   mT = nowS();
   if (shards) kick();
@@ -914,6 +980,36 @@ function shatter(cx, cy, now) {
     c.globalCompositeOperation = 'source-over';
     c.drawImage(ek, 0, 0, cw, ch, x0, y0, pw, ph);
 
+    // sprite refleksu (w px CSS): wnętrze odłamka z jaśniejszym pasmem pod losowym kątem
+    // (pasmo kolorowane losowym odcieniem, jak rozszczepienie światła) i obrys odłamka
+    // niska rozdzielczość (glintRes): refleksy są miękkie, a sprite jest wtedy tańszy w rysowaniu
+    // i pamięci; drobne okruchy w ogóle nie dostają refleksu
+    const hw = Math.max(1, Math.round(pw * CFG.glintRes)), hh = Math.max(1, Math.round(ph * CFG.glintRes));
+    const hl = Math.hypot(pw, ph) / 2 < 12 ? null : document.createElement("canvas");
+    let hc = null;
+    if (hl) { hl.width = hw; hl.height = hh; hc = hl.getContext("2d"); }
+    if (hl) {
+    hc.drawImage(mk, 0, 0, cw, ch, 0, 0, hw, hh);
+    hc.globalCompositeOperation = "source-in";
+    const ga = Math.random() * Math.PI, gdx = Math.cos(ga), gdy = Math.sin(ga);
+    const glen = Math.abs(hw * gdx) + Math.abs(hh * gdy) || 1;
+    const gg = hc.createLinearGradient(hw / 2 - gdx * glen / 2, hh / 2 - gdy * glen / 2,
+                                       hw / 2 + gdx * glen / 2, hh / 2 + gdy * glen / 2);
+    const hcol = HUE[Math.floor(Math.random() * NH)].map((v) => Math.min(255, v + 70));
+    const rgb = (a) => "rgba(" + hcol[0] + "," + hcol[1] + "," + hcol[2] + "," + a + ")";
+    const bc = rnd(0.25, 0.75), bw2 = rnd(0.08, 0.22), bc2 = Math.min(0.97, Math.max(0.03, bc + rnd(-0.4, 0.4)));
+    const stops = [[0, 0.05], [Math.max(0, bc - bw2), 0.05], [bc, 0.95], [Math.min(1, bc + bw2), 0.05],
+                   [Math.max(bc + bw2, bc2 - 0.04), 0.05], [bc2, 0.4], [Math.min(1, bc2 + 0.04), 0.05], [1, 0.05]];
+    let last = 0;
+    for (const [p, a] of stops) { const pp = Math.max(last, p); gg.addColorStop(pp, rgb(a)); last = pp; }
+    hc.fillStyle = gg;
+    hc.fillRect(0, 0, hw, hh);
+    hc.globalCompositeOperation = "source-over";
+    hc.globalAlpha = 0.9;
+    hc.drawImage(ek, 0, 0, cw, ch, 0, 0, hw, hh);
+    }
+    // pochylenie ścianki odłamka (kąt do ekranu), od prawie płaskiej do wyraźnie skośnej
+    const ta = Math.random() * Math.PI * 2, tm = rnd(0.12, 0.75);
     const dist = Math.hypot(ax - cx, ay - cy);
     let dx = ax - cx, dy = ay - cy;
     const dl = Math.hypot(dx, dy) || 1;
@@ -937,6 +1033,7 @@ function shatter(cx, cy, now) {
       // fs = 1 albo -1 (odłamek leży normalnie albo odwrócony)
       flip: 0, fw: Math.random() < 0.2 ? rnd(-9, 9) : 0, fs: 1,
       pushed: false,
+      hl, tx: Math.cos(ta) * tm, ty: Math.sin(ta) * tm, tz: Math.sqrt(1 - tm * tm),
       dead: false
     });
   }
@@ -949,7 +1046,9 @@ function shatter(cx, cy, now) {
 // grawitacja świata w układzie ekranu (x w prawo, y w dół), w jednostkach g:
 // [składowa wzdłuż ekranu x, składowa wzdłuż ekranu y, nacisk na ekran (do tarcia)]
 function slideAcc() {
-  const b = tiltB * Math.PI / 180, g = tiltG * Math.PI / 180;
+  // bez czujnika (komputer) nie ma jak poznać pochylenia: odłamki leżą płasko i zostają na miejscu
+  if (!gotTilt) return [0, 0, 1];
+  const b = physB * Math.PI / 180, g = physG * Math.PI / 180;
   return [Math.sin(g) * Math.cos(b), Math.sin(b), Math.abs(Math.cos(g) * Math.cos(b))];
 }
 
@@ -1022,21 +1121,54 @@ function drawShards(now, dt) {
 
   let alive = 0;
   const age = now - shards.t0;
-  ctx.globalAlpha = Math.max(0, Math.min(1, CFG.shardLife + 1 - age));
-  // najpierw leżące, na wierzchu te w powietrzu (lekko powiększone, bo bliżej oczu)
+  const fade = Math.max(0, Math.min(1, CFG.shardLife + 1 - age));
+  ctx.globalAlpha = fade;
+  // wektor połówkowy H = norm(L + V), V = (0,0,1) w układzie canvasa (y w dół)
+  const ll = Math.hypot(lx, ly, lz) || 1;
+  let hx = lx / ll, hy = -ly / ll, hz = lz / ll + 1;
+  const hn = Math.hypot(hx, hy, hz) || 1;
+  hx /= hn; hy /= hn; hz /= hn;
+  // najpierw leżące, na wierzchu te w powietrzu (lekko powiększone, bo bliżej oczu);
+  // refleksy każdej warstwy rysujemy hurtem po jej odłamkach (jedno przełączenie trybu mieszania)
+  const glints = [];
+  const DR = DPR;
   for (let pass = 0; pass < 2; pass++) {
+    glints.length = 0;
     for (const s of shards) {
       if (s.dead || (s.z > 0) !== (pass === 1)) continue;
       alive++;
       const k = 1 + s.z / 700;
-      ctx.save();
-      ctx.translate(s.x, s.y);
-      ctx.rotate(s.rot);
-      ctx.scale(k * (s.z > 0 ? Math.cos(s.flip) : s.fs), k);
+      const fl = s.z > 0 ? Math.cos(s.flip) : s.fs;
+      const cr = Math.cos(s.rot), sr = Math.sin(s.rot);
+      // macierz: przesunięcie (x, y) * obrót rot * skala (k * fl, k), razem ze skalą ekranu
+      const m0 = cr * k * fl * DR, m1 = sr * k * fl * DR, m2 = -sr * k * DR, m3 = cr * k * DR;
+      ctx.setTransform(m0, m1, m2, m3, s.x * DR, s.y * DR);
       ctx.drawImage(s.cv, s.bx - s.cx0, s.by - s.cy0, s.bw, s.bh);
-      ctx.restore();
+      if (CFG.glint > 0 && s.hl) {
+        // refleks: normalna ścianki obrócona przewrotem (wokół osi y odłamka, jak spłaszczenie
+        // w powietrzu) i obrotem w płaszczyźnie ekranu, błysk gdy zbliży się do H
+        const sn = s.z > 0 ? Math.sin(s.flip) : 0;
+        let nx = s.tx * fl + s.tz * sn, ny = s.ty, nz = -s.tx * sn + s.tz * fl;
+        if (nz < 0) { nx = -nx; ny = -ny; nz = -nz; }   // szkło odbija obiema stronami
+        const rx = nx * cr - ny * sr, ry = nx * sr + ny * cr;
+        const spec = Math.exp(-(1 - (rx * hx + ry * hy + nz * hz)) * CFG.glintShine);
+        const al = (0.04 + 0.96 * spec) * CFG.glint * fade;
+        if (al > 0.06) glints.push(s, al, m0, m1, m2, m3);
+      }
+    }
+    if (glints.length) {
+      ctx.globalCompositeOperation = "lighter";
+      for (let i = 0; i < glints.length; i += 6) {
+        const s = glints[i];
+        ctx.globalAlpha = Math.min(1, glints[i + 1]);
+        ctx.setTransform(glints[i + 2], glints[i + 3], glints[i + 4], glints[i + 5], s.x * DR, s.y * DR);
+        ctx.drawImage(s.hl, s.bx - s.cx0, s.by - s.cy0, s.bw, s.bh);
+      }
+      ctx.globalCompositeOperation = "source-over";
+      ctx.globalAlpha = fade;
     }
   }
+  ctx.setTransform(DR, 0, 0, DR, 0, 0);
   ctx.globalAlpha = 1;
   if (!alive || age > CFG.shardLife + 1) endShatter();
 }
@@ -1504,14 +1636,21 @@ function addDamage(v, x, y) {
 
 function busy() { return !!(shards || shatterAt); }
 
-function tap(x, y) {
+// rozmiar wgniotu: z powierzchni styku palca (PointerEvent.width/height w px, Android Chrome),
+// a gdy przeglądarka jej nie podaje (iOS, mysz), losowo
+function crushFor(size) {
+  const base = size >= 6 ? Math.max(CFG.crushMin, Math.min(CFG.crushMax, size * 0.8)) : rnd(CFG.crushMin, CFG.crushMax);
+  return base * rnd(0.85, 1.2);
+}
+
+function tap(x, y, size) {
   if (shards) { pushShards([[x, y]]); return; }
   if (busy()) return;
   hideHint();
   spawnStar(x, y, {
     rays: 7 + Math.floor(Math.random() * 5),
     lenMin: 0.3, lenMax: 0.72, w: 2.0,
-    ringStart: [26, 40], flash: true, haze: 90,
+    ringStart: [26, 40], flash: true, haze: 90, crush: crushFor(size),
     links: 3, ext: 6
   });
   hitSound(1);
@@ -1541,7 +1680,7 @@ function miniStar(x, y) {
   spawnStar(x, y, {
     rays: 4 + Math.floor(Math.random() * 3),
     lenMin: 0.08, lenMax: 0.2, w: 1.3,
-    ringStart: [14, 22], flash: true, haze: 40,
+    ringStart: [14, 22], flash: true, haze: 40, crush: 14,
     links: 1, ext: 2
   });
   hitSound(0.5);
@@ -1559,7 +1698,7 @@ cv.addEventListener('pointerdown', (e) => {
     x: e.clientX, y: e.clientY, lx: e.clientX, ly: e.clientY,
     step: rnd(32, 58), star: 0, nextStar: rnd(200, 320), t: performance.now(), v: 0
   });
-  tap(e.clientX, e.clientY);
+  tap(e.clientX, e.clientY, Math.max(e.width || 0, e.height || 0));
 });
 
 cv.addEventListener('pointermove', (e) => {
