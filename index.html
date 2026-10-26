@@ -62,6 +62,28 @@ body {
 
 .hint.on { opacity: 0.6; }
 
+.summary {
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: 50%;
+  transform: translateY(calc(-100% - 34px));
+  text-align: center;
+  font: 500 12px/1.9 var(--font-ui);
+  letter-spacing: 0.3em;
+  padding: 0 20px 0 calc(20px + 0.3em);
+  text-transform: uppercase;
+  color: var(--hint);
+  opacity: 0;
+  transition: opacity 1.6s ease;
+  pointer-events: none;
+}
+
+.summary.on { opacity: 0.8; }
+.summary .main { font-size: 14px; letter-spacing: 0.16em; color: #aeb9c2; margin-bottom: 6px; white-space: nowrap; }
+.summary .rec { color: #d3e9f7; }
+.summary .sub { font-size: 10px; letter-spacing: 0.16em; opacity: 0.85; }
+
 .sensor {
   position: fixed;
   left: 0;
@@ -79,13 +101,14 @@ body {
 .sensor.on { opacity: 0.8; }
 
 @media (prefers-reduced-motion: reduce) {
-  .hint { transition: none; }
+  .hint, .summary { transition: none; }
 }
 </style>
 </head>
 <body>
 <canvas id="glass" role="img" aria-label="Czarne szkło. Dotknij albo przesuń palcem, aby je stłuc."></canvas>
 <div id="hint" class="hint" aria-hidden="true">tap to start</div>
+<div id="summary" class="summary" aria-live="polite"><div class="main" id="sumMain"></div><div class="sub" id="sumSub1"></div></div>
 <div id="sensor" class="sensor" aria-live="polite"></div>
 
 <script>
@@ -129,6 +152,10 @@ const CFG = {
   floorPitch: 0.9,  // wysokość dźwięku upadku względem brzęku na ekranie (mniej = niżej)
   floorTone: 2800,    // Hz: filtr dolnoprzepustowy upadku (mniej = głuchszy, bardziej "z daleka")
   shardLife: 40,     // po ilu sekundach leżące odłamki same znikają
+  frameMin: 3,        // ile odłamków przy brzegu zostaje w ramce: losowo od frameMin do frameMax
+  frameMax: 9,
+  frameShake: 1.5,    // g: tak mocne szarpnięcie telefonem (po pierwszej sekundzie od rozbicia) odrywa wszystkie kawałki z ramki
+  rustleVol: 0.3,     // głośność szelestu zsuwających się odłamków
   loudness: 1.2,      // wzmocnienie po kompresorze (głośność całości; limiter pilnuje, żeby nie przesterować)
   hintDelay: 3500,    // po ilu ms bez dotyku pokazać "dotknij"
   baseLight: 0.15,    // jasność linii bez odbicia (0..1), im mniej, tym ciemniej poza refleksami
@@ -420,6 +447,19 @@ function pushClipped(out, x1, y1, x2, y2, t0, dur, w) {
 }
 
 function register(out, x, y, flash) {
+  // pęknięcia rosną kilka razy szybciej niż surowe czasy (pękają od razu po dotyku), z lekkim
+  // losowym rozrzutem na każde uderzenie: skracamy czasy względem początku uderzenia
+  let ts = Infinity;
+  for (let k = 0; k < 3; k++) for (const s of out[k]) if (s.t0 < ts) ts = s.t0;
+  if (ts < Infinity) {
+    const ck = 2.5 * rnd(0.8, 1.25);
+    for (let k = 0; k < 3; k++) {
+      for (const s of out[k]) {
+        s.t0 = ts + (s.t0 - ts) / ck;
+        s.t1 = ts + (s.t1 - ts) / ck;
+      }
+    }
+  }
   let tEnd = 0;
   for (let k = 0; k < 3; k++) {
     for (const s of out[k]) {
@@ -1024,7 +1064,7 @@ function shatter(cx, cy, now) {
       vz: Math.min(700, (220 + 30000 / (dist + 100)) * rnd(0.6, 1.1)),
       w: rnd(-2.5, 2.5) * (1 + 60 / (dist + 60)),
       mu: rnd(0.7, 1.3),
-      delay: now + 0.04 + (dist / maxR) * 0.22 + rnd(0, 0.08),
+      delay: now + 0.02 + (dist / maxR) * 0.12 + rnd(0, 0.04),
       r: Math.hypot(pw, ph) / 2,
       m, mw, mh, ol, ro,
       mass: cnt[l] * G * G,
@@ -1033,10 +1073,29 @@ function shatter(cx, cy, now) {
       // fs = 1 albo -1 (odłamek leży normalnie albo odwrócony)
       flip: 0, fw: Math.random() < 0.2 ? rnd(-9, 9) : 0, fs: 1,
       pushed: false,
+      stuck: false, edge: bx0[l] <= 0 || by0[l] <= 0 || bx1[l] >= gw - 1 || by1[l] >= gh - 1,
       hl, tx: Math.cos(ta) * tm, ty: Math.sin(ta) * tm, tz: Math.sqrt(1 - tm * tm),
       dead: false
     });
   }
+  // ostre odłamki przy brzegu zostają w ramce jak w prawdziwej szybie, dopóki ich ktoś nie ruszy
+  const edge = shards.filter((s) => s.edge && s.mass > 600);
+  for (let i = edge.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [edge[i], edge[j]] = [edge[j], edge[i]];
+  }
+  const nf = Math.min(edge.length, Math.floor(rnd(CFG.frameMin, CFG.frameMax + 1)));
+  for (let i = 0; i < nf; i++) {
+    const s = edge[i];
+    s.stuck = true;
+    s.vx = s.vy = s.w = s.vz = 0;
+    s.fw = 0;
+    s.mass0 = s.mass; s.inertia0 = s.inertia;
+    s.mass = 1e9; s.inertia = 1e13;   // dla innych kawałków to nieruchoma przeszkoda
+  }
+  stats.pieces = shards.length;
+  stats.bigShard = shards.reduce((m, s) => ((s.mass0 || s.mass) > (m.mass0 || m.mass) ? s : m), shards[0]);
+  stats.big = (stats.bigShard.mass0 || stats.bigShard.mass) / (W * H);
   shards.t0 = now;
   flashT = now;
   shatterSound();
@@ -1052,13 +1111,28 @@ function slideAcc() {
   return [Math.sin(g) * Math.cos(b), Math.sin(b), Math.abs(Math.cos(g) * Math.cos(b))];
 }
 
+// kawałek w ramce odrywa się po dotknięciu, mocnym uderzeniu innego kawałka albo szarpnięciu telefonu
+function releaseShard(s, quiet) {
+  if (!s.stuck) return;
+  s.stuck = false;
+  s.mass = s.mass0; s.inertia = s.inertia0;
+  s.delay = 0;
+  if (!quiet) snapSound();
+}
+
 function drawShards(now, dt) {
   const [gx, gy, gn] = slideAcc();
   const A = CFG.slide, HG = CFG.hopGravity;
   const mv = now - mT < 0.15 ? CFG.shake : 0;   // tylko świeże dane o ruchu telefonu
   const wz2 = mWz * mWz;
+  // pierwsza sekunda po rozbiciu pomijana: wibracja telefonu przy rozbiciu sama szarpie czujnikiem
+  if (mv && now - shards.t0 > 1.2 && Math.hypot(mAx, mAy, mAz) / 9.81 > CFG.frameShake) {
+    let any = false;
+    for (const s of shards) if (s.stuck) { releaseShard(s, true); s.vz = rnd(80, 220); any = true; }
+    if (any) snapSound();
+  }
   for (const s of shards) {
-    if (s.dead || now < s.delay) continue;
+    if (s.dead || now < s.delay || s.stuck) continue;
     // Telefon szarpnięty albo obrócony: odłamek z bezwładności "zostaje w miejscu", więc
     // w układzie ekranu czuje przyspieszenie przeciwne (plus odśrodkowe przy obrocie).
     // N to nacisk na ekran w jednostkach g; poniżej zera odłamek odrywa się od ekranu.
@@ -1116,6 +1190,20 @@ function drawShards(now, dt) {
       floorSound(s.mass, Math.hypot(s.vx, s.vy));
     }
   }
+
+  // szelest: zsuwające się i przesuwane odłamki szeleszczą o taflę i o siebie jednostajnym szumem;
+  // ton i głośność zależą od wielkości kawałków (duże: niżej i głośniej, drobne: wyżej i ciszej)
+  let rs = 0, rf = 0;
+  for (const s of shards) {
+    if (s.dead || s.stuck || s.z > 3 || now < s.delay) continue;
+    const sp = Math.hypot(s.vx, s.vy);
+    if (sp < 25) continue;
+    const size = Math.min(1, Math.sqrt(s.mass) / 120);
+    const w = Math.min(sp, 700) / 700 * (0.25 + 0.75 * size);
+    rs += w;
+    rf += w * Math.log(RUSTLE_HIGH * Math.pow(RUSTLE_LOW / RUSTLE_HIGH, size));
+  }
+  rustleSet(rs > 0.02 ? Math.pow(1 - Math.exp(-rs * 0.3), 1.6) : 0, rs > 0 ? Math.exp(rf / rs) : 3000);
 
   collide(now);
 
@@ -1257,9 +1345,40 @@ function collide(now) {
       const sa = b.mass / (a.mass + b.mass);
       a.x += nx * 0.8 * sa; a.y += ny * 0.8 * sa;
       b.x -= nx * 0.8 * (1 - sa); b.y -= ny * 0.8 * (1 - sa);
-      if (-vn > 120 && now - lastClink > 0.04) { lastClink = now; clink(Math.min(1, -vn / 600) * 0.35); }
+      if (-vn > 120 && now - lastClink > 0.09) { lastClink = now; clink(Math.min(1, -vn / 600) * 0.35); }
     }
   }
+}
+
+// szelest szkła sunącego po szkle: jeden ciągły szum (zapętlony szum przez filtr pasmowy), którego
+// głośność i środek pasma zmieniamy płynnie co klatkę; level 0 wycisza
+const RUSTLE_HIGH = 7500, RUSTLE_LOW = 1800;   // Hz: środek pasma dla drobnego okruchu i dużego kawałka
+let rustleNode = null;
+function rustleSet(level, freq) {
+  if (!AC || !noiseBuf) return;
+  if (!rustleNode) {
+    if (level <= 0) return;
+    const src = AC.createBufferSource();
+    src.buffer = noiseBuf; src.loop = true;
+    const f = AC.createBiquadFilter();
+    f.type = "bandpass"; f.Q.value = 0.7; f.frequency.value = freq;
+    const g = AC.createGain();
+    g.gain.value = 0;
+    src.connect(f); f.connect(g); g.connect(master);
+    src.start();
+    rustleNode = { f, g };
+  }
+  const t = AC.currentTime;
+  rustleNode.g.gain.setTargetAtTime(level * 0.04 * CFG.rustleVol, t, 0.08);
+  rustleNode.f.frequency.setTargetAtTime(freq, t, 0.08);
+}
+
+// trzask oderwania kawałka z ramki
+function snapSound() {
+  if (!AC) return;
+  nb(0, 0.012, 'highpass', 2500, 0.8, 0.3, 0.001);
+  ping(0.002, rnd(2600, 4200), rnd(0.08, 0.18), 0.08);
+  crackle(3, 0.06, 0.5);
 }
 
 // cichy brzęk szkła o szkło
@@ -1279,11 +1398,13 @@ function floorSound(mass, speed) {
   // gdy naraz spada dużo odłamków, część dźwięków pomijamy, żeby nie przesterować
   while (floorHits.length && floorHits[0] < now - 0.2) floorHits.shift();
   if (floorHits.length >= 8) return;
+  // im więcej upadków naraz, tym ciszej każdy (suma nie przeciąża toru wyjścia)
+  const crowd = 1 / Math.sqrt(1 + floorHits.length * 0.6);
   floorHits.push(now);
   outNode = getFloorBus();
 
   const size = Math.min(1, Math.sqrt(mass) / 120);   // 0 = okruch, 1 = duży kawałek
-  const g = CFG.floorVol * (0.5 + 0.5 * size) * (0.85 + 0.15 * Math.min(1, speed / 1500));
+  const g = CFG.floorVol * crowd * (0.5 + 0.5 * size) * (0.85 + 0.15 * Math.min(1, speed / 1500));
   let t = CFG.floorDelay + rnd(0, 0.08);
   // wysokość tonu z wielkości kawałka (skala logarytmiczna: okruch floorHigh, duży floorLow),
   // z małym rozrzutem, żeby wielkość była wyraźnie słyszalna
@@ -1363,6 +1484,7 @@ function pushShards(pts, fv, ux, uy) {
       }
     }
     if (!k) continue;
+    if (s.stuck) releaseShard(s);
     const dx = s.x - hx, dy = s.y - hy, d = Math.hypot(dx, dy) || 1;
     const rx = dx / d, ry = dy / d;
     if (drag) {
@@ -1391,7 +1513,83 @@ function pushShards(pts, fv, ux, uy) {
   kick();
 }
 
+/* ---------- podsumowanie po opróżnieniu planszy ---------- */
+const summary = document.getElementById("summary");
+const stats = { pieces: 0, big: 0, bigShard: null };
+const BEST_KEY = "pekator-rekord", BEST_BIG_KEY = "pekator-rekord-kawalek";
+function loadNum(k) { try { return parseFloat(localStorage.getItem(k)) || 0; } catch (e) { return 0; } }
+function saveNum(k, v) { try { localStorage.setItem(k, String(v)); } catch (e) {} }
+const plural = (n, a, b, c) => (n === 1 ? a : (n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 12 || n % 100 > 14) ? b : c));
+const fmt1 = (v) => v.toFixed(1).replace(".", ",");
+let summaryTimer = 0;
+let trophy = null;   // największy kawałek ostatniej szyby: kręci się w 3D nad podsumowaniem
+
+function showSummary() {
+  const best = loadNum(BEST_KEY), bestBig = loadNum(BEST_BIG_KEY);
+  const isNew = stats.pieces > best, isNewBig = stats.big > bestBig + 1e-9;
+  if (isNew) saveNum(BEST_KEY, stats.pieces);
+  if (isNewBig) saveNum(BEST_BIG_KEY, stats.big);
+  const main = document.getElementById("sumMain"), sub = document.getElementById("sumSub1");
+  main.textContent = stats.pieces + " " + plural(stats.pieces, "kawałek", "kawałki", "kawałków") +
+    "  ·  " + (isNew ? "nowy rekord" : "rekord " + best);
+  sub.textContent = "największy " + fmt1(stats.big * 100) + "% szyby  ·  " +
+    (isNewBig ? "nowy rekord" : "rekord " + fmt1(bestBig * 100) + "%");
+  main.classList.toggle("rec", isNew);
+  sub.classList.toggle("rec", isNewBig);
+  const s = stats.bigShard, glow = isNewBig ? 2.2 : 1;
+  clearTimeout(summaryTimer);
+  summaryTimer = setTimeout(() => {   // najpierw chwila czystej czerni
+    summary.classList.add("on");
+    if (!s) return;
+    // kawałek dopasowany do pudełka nad tekstem i ustawiony tuż nad nim
+    const top = summary.getBoundingClientRect().top;
+    const box = Math.max(50, Math.min(120, top - 60));
+    const scale = Math.min(1, box / Math.max(s.bw, s.bh));
+    const size = Math.max(s.bw, s.bh) * scale;
+    trophy = { s, scale, size, cy: top - 26 - size / 2, glow, t0: nowS(), off: 0 };
+    kick();
+  }, 600);
+}
+
+// największy kawałek obraca się w 3D wokół osi pionowej (ściśnięcie w poziomie plus lekkie
+// pochylenie jak w perspektywie), z poświatą za nim i refleksem przebiegającym po powierzchni
+function drawTrophy(now) {
+  const t = trophy;
+  if (!t) return;
+  let a = Math.min(1, (now - t.t0) / 1.6);
+  if (t.off) {
+    a *= Math.max(0, 1 - (now - t.off) / 0.4);
+    if (a <= 0) { trophy = null; return; }
+  }
+  const s = t.s, sc = t.scale, cx = W / 2, cy = t.cy;
+  const ang = (now - t.t0) * 1.1 + 0.6, c = Math.cos(ang), sn = Math.sin(ang);
+  ctx.save();
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const r = t.size * 0.95;
+  const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+  g.addColorStop(0, "rgba(170,215,255," + (0.16 * a * t.glow) + ")");
+  g.addColorStop(1, "rgba(170,215,255,0)");
+  ctx.globalCompositeOperation = "lighter";
+  ctx.fillStyle = g;
+  ctx.fillRect(cx - r, cy - r, 2 * r, 2 * r);
+  ctx.globalCompositeOperation = "source-over";
+  ctx.transform(1, 0, 0, 1, cx, cy);
+  ctx.transform(c * sc, 0.12 * sn * sc, 0, sc, 0, 0);
+  ctx.globalAlpha = a;
+  ctx.drawImage(s.cv, s.bx - s.cx0, s.by - s.cy0, s.bw, s.bh);
+  ctx.globalCompositeOperation = "lighter";
+  ctx.globalAlpha = a * 0.7;
+  ctx.drawImage(s.cv, s.bx - s.cx0, s.by - s.cy0, s.bw, s.bh);
+  if (s.hl) {
+    ctx.globalAlpha = a * (0.15 + 0.85 * Math.pow(Math.abs(Math.sin(ang * 0.9 + 1)), 6));
+    ctx.drawImage(s.hl, s.bx - s.cx0, s.by - s.cy0, s.bw, s.bh);
+  }
+  ctx.restore();
+}
+
 function endShatter() {
+  showSummary();
+  if (rustleNode) rustleSet(0, 3000);
   shards = null;
   lctx.clearRect(0, 0, W, H);
   impacts.length = 0;
@@ -1431,6 +1629,8 @@ function frame() {
     }
   }
 
+  drawTrophy(now);
+
   const fa = flashT ? now - flashT : 1;
   if (fa >= 0 && fa < 0.18) {
     ctx.globalCompositeOperation = 'lighter';
@@ -1439,7 +1639,7 @@ function frame() {
     ctx.globalCompositeOperation = 'source-over';
   }
 
-  if (impacts.length || shards || shatterAt || fa < 0.2 || lightMoving()) kick(); else lastT = 0;
+  if (impacts.length || shards || shatterAt || fa < 0.2 || lightMoving() || trophy) kick(); else lastT = 0;
 }
 
 /* ---------- dźwięk (Web Audio, bez plików) ---------- */
@@ -1513,11 +1713,19 @@ function initAudio() {
 // (przeciążenie wątku audio) i przesterowaniem, gdy naraz spada dużo odłamków.
 const VOICE_SLOT = 16;
 const voiceSlots = new Map();
-function allowVoice(t0, gain) {
+const MAX_VOICES = 12;   // najwięcej głosów brzmiących w jednej chwili
+let vlist = [];
+function allowVoice(t0, gain, dur) {
+  const now = AC.currentTime;
+  if (vlist.length > 80) vlist = vlist.filter((v) => v.e > now);
+  let active = 0;
+  for (const v of vlist) if (v.s <= t0 && v.e >= t0) active++;
+  if (active >= MAX_VOICES || (active >= MAX_VOICES * 0.6 && gain < 0.04)) return false;
   const slot = Math.floor(t0 * 20);
   const c = voiceSlots.get(slot) || 0;
   if (c >= VOICE_SLOT || (c >= VOICE_SLOT * 0.6 && gain < 0.04)) return false;
   voiceSlots.set(slot, c + 1);
+  vlist.push({ s: t0, e: t0 + dur });
   if (voiceSlots.size > 200) {
     const old = Math.floor(AC.currentTime * 20) - 2;
     for (const k of voiceSlots.keys()) if (k < old) voiceSlots.delete(k);
@@ -1529,7 +1737,7 @@ function nb(t, dur, type, freq, q, gain, attack, endFreq) {
   if (!AC) return;
   attack = attack || 0.001;
   const t0 = AC.currentTime + t;
-  if (!allowVoice(t0, gain)) return;
+  if (!allowVoice(t0, gain, dur)) return;
   const src = AC.createBufferSource();
   src.buffer = noiseBuf;
   const f = AC.createBiquadFilter();
@@ -1549,7 +1757,7 @@ function nb(t, dur, type, freq, q, gain, attack, endFreq) {
 function ping(t, freq, dur, gain, endFreq) {
   if (!AC) return;
   const t0 = AC.currentTime + t;
-  if (!allowVoice(t0, gain)) return;
+  if (!allowVoice(t0, gain, dur)) return;
   const o = AC.createOscillator();
   o.type = 'sine';
   o.frequency.setValueAtTime(freq, t0);
@@ -1621,6 +1829,9 @@ function armHint() {
 }
 function hideHint() {
   clearTimeout(idleTimer);
+  clearTimeout(summaryTimer);
+  summary.classList.remove("on");
+  if (trophy) trophy.off = nowS();
   hint.classList.remove('on');
 }
 
@@ -1628,7 +1839,7 @@ function hideHint() {
 function addDamage(v, x, y) {
   damage += v;
   if (damage >= CFG.limit && !shatterAt && !shards) {
-    shatterAt = nowS() + 0.32;
+    shatterAt = nowS() + 0.06;
     shX = x; shY = y;
     kick();
   }
