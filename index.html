@@ -95,8 +95,8 @@ body {
 /* ---------- ustawienia (tu możesz kręcić) ---------- */
 const CFG = {
   limit: 10,          // ile "obrażeń" wytrzymuje szkło, zanim się rozsypie
-  tapDamage: 2,       // pojedyncze uderzenie
-  trailDamage: 0.8,   // odcinek pęknięcia za palcem
+  tapDamage: 1,       // pojedyncze uderzenie
+  trailDamage: 0.2,   // odcinek pęknięcia za palcem
   starDamage: 0.5,    // mały "wybuch" w trakcie przeciągania
   hitStop: 0.9,       // szansa, że nowe pęknięcie urwie się na istniejącym (reszta: przecina je)
   hitJoin: 0.3,       // szansa, że po dojściu do starego pęknięcia odgałęzi się dalej wzdłuż niego
@@ -112,7 +112,19 @@ const CFG = {
   bounce: 0.2,       // sprężystość zderzeń odłamków między sobą (0 = bez odbicia, 1 = pełne)
   shake: 3.0,         // wzmocnienie reakcji na szarpnięcia, podrzuty i obroty telefonu
   hopGravity: 8600,   // px/s^2: jak szybko podskakujący odłamek opada z powrotem na ekran
-  shardLife: 40,      // po ilu sekundach leżące odłamki same znikają
+  floorDelay: 0.45,   // s: po ilu sekundach odłamek, który wyjechał za ekran, uderza o podłogę
+  floorVol: 1.3,      // głośność upadku odłamków na podłogę
+  floorBounceSpeed: 200,   // px/s: co tyle prędkości wylotu dochodzi jedno odbicie od podłogi
+  floorBounceMax: 15,       // najwięcej odbić od podłogi
+  floorBounceDecay: 0.8,  // ile głośności zostaje przy każdym kolejnym odbiciu (0..1)
+  floorGapSmall: 0.6,      // mnożnik odstępu między odbiciami dla najmniejszego okruchu (mniej = szybciej)
+  floorGapLarge: 2.2,      // mnożnik odstępu między odbiciami dla największego kawałka (więcej = wolniej)
+  floorHigh: 5200,         // Hz: ton upadku najmniejszego okruchu
+  floorLow: 2100,           // Hz: ton upadku największego kawałka (większe = niższe)
+  floorPitch: 0.9,  // wysokość dźwięku upadku względem brzęku na ekranie (mniej = niżej)
+  floorTone: 2800,    // Hz: filtr dolnoprzepustowy upadku (mniej = głuchszy, bardziej "z daleka")
+  shardLife: 40,     // po ilu sekundach leżące odłamki same znikają
+  loudness: 1.2,      // wzmocnienie po kompresorze (głośność całości; limiter pilnuje, żeby nie przesterować)
   hintDelay: 3500,    // po ilu ms bez dotyku pokazać "dotknij"
   baseLight: 0.15,    // jasność linii bez odbicia (0..1), im mniej, tym ciemniej poza refleksami
   tiltGain: 1.7,      // ile razy wzmocnić pochylenie telefonu (większe = silniejsza reakcja)
@@ -1000,7 +1012,10 @@ function drawShards(now, dt) {
     s.x += s.vx * dt;
     s.y += s.vy * dt;
     s.rot += s.w * dt;
-    if (s.x + s.r < -30 || s.x - s.r > W + 30 || s.y + s.r < -30 || s.y - s.r > H + 30) s.dead = true;
+    if (s.x + s.r < -30 || s.x - s.r > W + 30 || s.y + s.r < -30 || s.y - s.r > H + 30) {
+      s.dead = true;
+      floorSound(s.mass, Math.hypot(s.vx, s.vy));
+    }
   }
 
   collide(now);
@@ -1122,6 +1137,79 @@ function clink(g) {
   nb(0, rnd(0.004, 0.008), 'highpass', rnd(4000, 8000), 1, 0.12 * g);
 }
 
+// Odłamek, który wyjechał za ekran, po CFG.floorDelay s spada na podłogę: uderzenie
+// (głośniejsze niż brzęk na ekranie), czasem rozprysk na drobniejsze kawałki
+// i kilka coraz krótszych, cichszych odbić. Duże kawałki brzmią niżej i głośniej.
+const floorHits = [];
+function floorSound(mass, speed) {
+  if (!AC) return;
+  const now = AC.currentTime;
+  // gdy naraz spada dużo odłamków, część dźwięków pomijamy, żeby nie przesterować
+  while (floorHits.length && floorHits[0] < now - 0.2) floorHits.shift();
+  if (floorHits.length >= 8) return;
+  floorHits.push(now);
+  outNode = getFloorBus();
+
+  const size = Math.min(1, Math.sqrt(mass) / 120);   // 0 = okruch, 1 = duży kawałek
+  const g = CFG.floorVol * (0.5 + 0.5 * size) * (0.85 + 0.15 * Math.min(1, speed / 1500));
+  let t = CFG.floorDelay + rnd(0, 0.08);
+  // wysokość tonu z wielkości kawałka (skala logarytmiczna: okruch floorHigh, duży floorLow),
+  // z małym rozrzutem, żeby wielkość była wyraźnie słyszalna
+  const base = CFG.floorHigh * Math.pow(CFG.floorLow / CFG.floorHigh, size) * rnd(0.93, 1.07) * CFG.floorPitch;
+  // pierwsze uderzenie
+  nb(t, rnd(0.008, 0.015), 'highpass', rnd(2500, 5000), 0.8, 0.3 * g);
+  nb(t, 0.05, 'bandpass', rnd(600, 1200), 1.2, 0.12 * g * size);
+  // głuche stuknięcie o podłogę
+  nb(t, 0.07, 'lowpass', rnd(220, 380), 0.9, 0.35 * g * (0.4 + 0.6 * size), 0.002);
+  [1, 1.53, 2.21, 2.97].forEach((m, i) => {
+    ping(t + 0.002, base * m * rnd(0.97, 1.03), rnd(0.12, 0.3) / (1 + i * 0.4), 0.1 * g / (1 + i * 0.6));
+  });
+  // większy kawałek pęka przy upadku i rozsypuje się drobnymi okruchami
+  if (Math.random() < 0.3 + 0.6 * size) {
+    const n = 3 + Math.floor(size * 7);
+    for (let i = 0; i < n; i++) {
+      const tt = t + 0.01 + Math.pow(Math.random(), 1.4) * 0.3;
+      ping(tt, rnd(3500, 9000) * CFG.floorPitch, rnd(0.03, 0.1), rnd(0.02, 0.05) * g);
+      nb(tt, rnd(0.003, 0.007), 'highpass', rnd(4000, 8000), 1, rnd(0.06, 0.14) * g);
+    }
+  }
+  // odbicia: im szybciej odłamek wyleciał, tym więcej odbić i dłuższy pierwszy skok;
+  // każde kolejne krótsze i cichsze
+  const bounces = Math.min(CFG.floorBounceMax,
+    1 + Math.floor(speed / CFG.floorBounceSpeed + Math.random()));
+  // odstęp między odbiciami zależy od wielkości: okruchy odbijają się szybko (floorGapSmall),
+  // duże kawałki wolniej (floorGapLarge), pośrednie logarytmicznie pomiędzy
+  const gapK = CFG.floorGapSmall * Math.pow(CFG.floorGapLarge / CFG.floorGapSmall, size);
+  let gap = (rnd(0.08, 0.12) + Math.min(0.12, speed / 20000)) * gapK, gb = g * 0.5;
+  for (let i = 0; i < bounces; i++) {
+    t += gap;
+    ping(t, base * rnd(0.98, 1.08), rnd(0.05, 0.14) * (1 + size), 0.08 * gb);
+    nb(t, rnd(0.004, 0.009) * (1 + size), 'highpass', base * rnd(1.4, 2), 1, 0.22 * gb);
+    gap *= rnd(0.55, 0.72);
+    gb *= CFG.floorBounceDecay * rnd(0.85, 1.1);
+  }
+  outNode = null;
+}
+
+// tor dźwięku upadku: filtr dolnoprzepustowy (głuchszy, dalszy dźwięk)
+// i krótkie echo pomieszczenia, żeby upadek brzmiał inaczej niż brzęk na ekranie
+let floorBus = null;
+function getFloorBus() {
+  if (floorBus) return floorBus;
+  const lp = AC.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.value = CFG.floorTone;
+  lp.Q.value = 0.7;
+  const dl = AC.createDelay(0.3), fb = AC.createGain(), wet = AC.createGain();
+  dl.delayTime.value = 0.055;
+  fb.gain.value = 0.3;
+  wet.gain.value = 0.35;
+  lp.connect(master);
+  lp.connect(dl); dl.connect(fb); fb.connect(dl); dl.connect(wet); wet.connect(master);
+  floorBus = lp;
+  return floorBus;
+}
+
 // palec podrzuca i odpycha tylko odłamki, których faktycznie dotknie; pts to punkty pod palcem.
 // Samo dotknięcie (fv nieokreślone) odpycha od palca z siłą pushForce. Przy przesuwaniu
 // odłamek dostaje prędkość palca (fv, px/s) razy pushGain w kierunku ruchu (ux, uy),
@@ -1224,6 +1312,7 @@ function frame() {
 
 /* ---------- dźwięk (Web Audio, bez plików) ---------- */
 let AC = null, master = null, noiseBuf = null, iosDone = false;
+let outNode = null;   // gdzie podłączać nowe dźwięki (null = master); floorSound kieruje je przez floorBus
 
 function unlockIOS() {
   if (iosDone) return;
@@ -1252,13 +1341,28 @@ function initAudio() {
       const Ctor = window.AudioContext || window.webkitAudioContext;
       if (!Ctor) return;
       AC = new Ctor();
+      // tor wyjścia, żeby wiele dźwięków naraz nie przesterowało głośnika telefonu:
+      // filtr górnoprzepustowy (głośnik i tak nie zagra basu, a bas go dławi) ->
+      // kompresor (wyrównuje) -> wzmocnienie (przywraca głośność) -> limiter (szczyty) ->
+      // miękkie obcięcie (ostatnia zapora zamiast twardego trzasku)
+      const hp = AC.createBiquadFilter();
+      hp.type = 'highpass'; hp.frequency.value = 160; hp.Q.value = 0.7;
       const comp = AC.createDynamicsCompressor();
-      comp.threshold.value = -14; comp.knee.value = 18; comp.ratio.value = 6;
-      comp.attack.value = 0.002; comp.release.value = 0.12;
+      comp.threshold.value = -20; comp.knee.value = 12; comp.ratio.value = 4;
+      comp.attack.value = 0.003; comp.release.value = 0.15;
+      const makeup = AC.createGain();
+      makeup.gain.value = CFG.loudness;
+      const lim = AC.createDynamicsCompressor();
+      lim.threshold.value = -4; lim.knee.value = 0; lim.ratio.value = 20;
+      lim.attack.value = 0.001; lim.release.value = 0.08;
+      const clip = AC.createWaveShaper();
+      const cn = 1024, curve = new Float32Array(cn);
+      for (let i = 0; i < cn; i++) { const x = i / (cn - 1) * 2 - 1; curve[i] = Math.tanh(x * 1.3) / Math.tanh(1.3); }
+      clip.curve = curve;
       master = AC.createGain();
       master.gain.value = 0.9;
-      master.connect(comp);
-      comp.connect(AC.destination);
+      master.connect(hp); hp.connect(comp); comp.connect(makeup); makeup.connect(lim);
+      lim.connect(clip); clip.connect(AC.destination);
       const len = AC.sampleRate * 2;
       noiseBuf = AC.createBuffer(1, len, AC.sampleRate);
       const d = noiseBuf.getChannelData(0);
@@ -1272,10 +1376,28 @@ function initAudio() {
   } catch (e) {}
 }
 
+// Limit głosów: w każdym okienku 50 ms może wystartować najwyżej VOICE_SLOT dźwięków,
+// a gdy okienko się zapełnia, najpierw odpadają ciche. Chroni przed zakrztuszeniem
+// (przeciążenie wątku audio) i przesterowaniem, gdy naraz spada dużo odłamków.
+const VOICE_SLOT = 16;
+const voiceSlots = new Map();
+function allowVoice(t0, gain) {
+  const slot = Math.floor(t0 * 20);
+  const c = voiceSlots.get(slot) || 0;
+  if (c >= VOICE_SLOT || (c >= VOICE_SLOT * 0.6 && gain < 0.04)) return false;
+  voiceSlots.set(slot, c + 1);
+  if (voiceSlots.size > 200) {
+    const old = Math.floor(AC.currentTime * 20) - 2;
+    for (const k of voiceSlots.keys()) if (k < old) voiceSlots.delete(k);
+  }
+  return true;
+}
+
 function nb(t, dur, type, freq, q, gain, attack, endFreq) {
   if (!AC) return;
   attack = attack || 0.001;
   const t0 = AC.currentTime + t;
+  if (!allowVoice(t0, gain)) return;
   const src = AC.createBufferSource();
   src.buffer = noiseBuf;
   const f = AC.createBiquadFilter();
@@ -1287,7 +1409,7 @@ function nb(t, dur, type, freq, q, gain, attack, endFreq) {
   g.gain.setValueAtTime(0.0001, t0);
   g.gain.linearRampToValueAtTime(gain, t0 + attack);
   g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
-  src.connect(f); f.connect(g); g.connect(master);
+  src.connect(f); f.connect(g); g.connect(outNode || master);
   src.start(t0, Math.random() * (noiseBuf.duration - dur - 0.1));
   src.stop(t0 + dur + 0.02);
 }
@@ -1295,6 +1417,7 @@ function nb(t, dur, type, freq, q, gain, attack, endFreq) {
 function ping(t, freq, dur, gain, endFreq) {
   if (!AC) return;
   const t0 = AC.currentTime + t;
+  if (!allowVoice(t0, gain)) return;
   const o = AC.createOscillator();
   o.type = 'sine';
   o.frequency.setValueAtTime(freq, t0);
@@ -1303,7 +1426,7 @@ function ping(t, freq, dur, gain, endFreq) {
   g.gain.setValueAtTime(0.0001, t0);
   g.gain.linearRampToValueAtTime(gain, t0 + 0.003);
   g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
-  o.connect(g); g.connect(master);
+  o.connect(g); g.connect(outNode || master);
   o.start(t0); o.stop(t0 + dur + 0.02);
 }
 
